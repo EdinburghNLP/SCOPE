@@ -1,0 +1,39 @@
+Generate a challenging long-form task using the source document and retrieved information.
+
+## Source Document
+{source_document}
+
+## Task Type
+
+You must generate a task of type: **{task_type}**
+
+{task_description}
+
+## Instructions
+
+You will use exactly **{num_search_turns}** search turns. Each search must be about ONE specific entity that appears by name in the PREVIOUS search results — not the source document topic. When told your searches are complete, produce the final task.
+
+The final task MUST require unique facts from ALL search turns — if any search turn's results could be removed without affecting the answer, the task is invalid.
+
+## Search Turn Format
+
+<think>
+Analysis of search results...
+What new entity or fact to follow next...
+</think>
+<function_calls>search(query="your search query")</function_calls>
+
+## Final Task Format (when told searches are complete)
+
+<think>
+Verify:
+- Each search turn contributed a unique essential fact not in the source document
+- The task requires ALL of these facts to answer fully
+- Entities are identifiable (full names + generic qualifier if needed; acronyms expanded)
+- No answer leakage (no specific facts/dates/stats/secondary names)
+- Requires retrieval (cannot be answered from the prompt alone)
+- Specifies output format
+- English only
+</think>
+
+<task>The task prompt for the solver. Must withhold searchable information.</task>

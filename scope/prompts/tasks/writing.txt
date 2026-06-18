@@ -1,0 +1,2 @@
+Compose formal documents with explicit structure (introduction, body, conclusion). Essays, articles, reports that may require citations or specific formatting.
+Examples: "Write an argumentative essay on climate policy with cited sources", "Draft a technical report analyzing Q3 trends"

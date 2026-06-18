@@ -1,0 +1,517 @@
+"""Parser for solver model outputs.
+
+This module extracts structured information from solver LLM outputs, including
+answers, thinking blocks, and tool calls using regex-based tag extraction.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from typing import List
+
+# Regex patterns for tag extraction
+ANSWER_PATTERN = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
+THINK_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+# Matches a user/environment turn segment inside a concatenated multi-turn
+# response. Rollouts are decoded with skip_special_tokens=True, so role
+# boundaries appear as bare "\nuser\n" ... "\nassistant\n" (no <|im_start|>
+# markers). Also handles a leading "user\n" (no preceding newline) and a
+# tail user turn (no trailing "\nassistant\n"). Used to prevent literal
+# <answer> tags inside env-injected text (e.g. the force-answer nudge
+# "Wrap it in <answer> and </answer> tags.") from polluting answer
+# extraction.
+_ENV_TURN_RE = re.compile(
+    r"(?:(?<=\n)|^)user\n.*?(?=\nassistant\n|\Z)",
+    re.DOTALL,
+)
+# Belt-and-braces: also drop raw ChatML user turns if a caller ever passes
+# un-detokenized text.
+_CHATML_USER_RE = re.compile(
+    r"<\|im_start\|>user\n.*?<\|im_end\|>",
+    re.DOTALL,
+)
+# Splits a concatenated multi-turn response into role-tagged segments.
+# Captures the role name ("user" or "assistant") so `re.split` interleaves
+# [pre_role_text, role, text, role, text, ...].
+_ROLE_SPLIT_RE = re.compile(r"(?:\n|^)(user|assistant)\n")
+TOOL_CALL_PATTERN = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+SEARCH_R1_PATTERN = re.compile(r"<search>(.*?)</search>", re.DOTALL)
+# OLMo function_calls patterns
+FC_SEARCH_PATTERN = re.compile(
+    r'<function_calls>\s*search\s*\(\s*query\s*=\s*["\'](.+?)["\']\s*\)',
+    re.DOTALL,
+)
+FC_ANSWER_PATTERN = re.compile(
+    r'<function_calls>\s*answer\s*\(\s*answer\s*=\s*["\'](.+?)["\']\s*\)',
+    re.DOTALL,
+)
+# DR-Tulu <call_tool name="...">query</call_tool> format
+CALL_TOOL_SEARCH_PATTERN = re.compile(
+    r"<call_tool\s+[^>]*?>(.*?)(?:</call_tool>|</call>)",
+    re.DOTALL,
+)
+# WebThinker <|begin_search_query|>query<|end_search_query|> format
+WEBTHINKER_SEARCH_PATTERN = re.compile(
+    r"<\|begin_search_query\|>(.*?)<\|end_search_query\|>",
+    re.DOTALL,
+)
+# WebExplorer <tool_call>{"name":"search","arguments":{"queries":[...]}}</tool_call>
+WEBEXPLORER_TOOL_CALL_PATTERN = re.compile(
+    r"<tool_call>(.*?)</tool_call>",
+    re.DOTALL,
+)
+# \boxed{answer} format (WebThinker, QwQ models)
+BOXED_ANSWER_PATTERN = re.compile(r"\\boxed\{([^}]*)\}")
+
+
+@dataclass
+class SolverParseResult:
+    """Result of parsing a solver model output.
+
+    Args:
+        answer: The extracted answer from <answer> tags, or None if not found.
+        thinking_blocks: List of content from <think> tags in order of appearance.
+        tool_calls: List of raw content from <tool_call> tags.
+        search_queries: List of queries from <search> tags (search_r1 format).
+        raw_response: The original unparsed response string.
+        errors: List of error messages encountered during parsing.
+    """
+
+    answer: str | None = None
+    thinking_blocks: List[str] = field(default_factory=list)
+    tool_calls: List[str] = field(default_factory=list)
+    search_queries: List[str] = field(default_factory=list)
+    raw_response: str = ""
+    errors: List[str] = field(default_factory=list)
+
+    @property
+    def is_valid(self) -> bool:
+        """Check if the parse result is valid.
+
+        A valid result has an answer and no parsing errors.
+
+        Returns:
+            True if the result has an answer and no errors.
+        """
+        return self.answer is not None and len(self.errors) == 0
+
+    @property
+    def has_tool_calls(self) -> bool:
+        """Check if the response contains tool calls.
+
+        Returns:
+            True if at least one tool call was found.
+        """
+        return len(self.tool_calls) > 0
+
+    @property
+    def num_thinking_blocks(self) -> int:
+        """Get the number of thinking blocks.
+
+        Returns:
+            Count of thinking blocks found.
+        """
+        return len(self.thinking_blocks)
+
+
+def _strip_env_turns(content: str) -> str:
+    """Remove user/environment turn segments from multi-turn response text.
+
+    Rollouts concatenate assistant turns with env/user turns (retrieval
+    results, force-answer nudges). Literal ``<answer>`` tags inside those
+    env turns must not be mistaken for the model's answer.
+
+    Args:
+        content: Raw concatenated solver response possibly containing
+            interleaved ``\\nuser\\n...\\nassistant\\n`` role segments or
+            raw ChatML ``<|im_start|>user\\n...<|im_end|>`` segments.
+
+    Returns:
+        ``content`` with env/user segments removed so that downstream tag
+        extraction only sees text generated by the assistant.
+    """
+    content = _CHATML_USER_RE.sub("", content)
+    content = _ENV_TURN_RE.sub("", content)
+    return content
+
+
+def _iter_assistant_segments(content: str) -> List[tuple[str, bool]]:
+    """Split a multi-turn response into assistant-only segments.
+
+    Drops any ``<|im_start|>user\\n...<|im_end|>`` ChatML user blocks
+    first, then splits on bare ``\\nuser\\n`` / ``\\nassistant\\n`` role
+    markers. The text before the first role marker is treated as the
+    first assistant turn (rollouts do not prefix the first generation
+    with an ``assistant\\n`` header).
+
+    Args:
+        content: Raw concatenated solver response.
+
+    Returns:
+        List of ``(segment_text, is_last_segment)`` tuples for each
+        assistant segment in order of appearance. ``is_last_segment`` is
+        ``True`` only for the segment whose text reaches end-of-string
+        (i.e., not terminated by a following env turn).
+    """
+    content = _CHATML_USER_RE.sub("", content)
+    parts = _ROLE_SPLIT_RE.split(content)
+    # parts[0] is the text before any role marker (first assistant turn).
+    # Then pairs of [role, text] follow.
+    segments: List[tuple[str, str]] = []  # (role, text)
+    if parts[0]:
+        segments.append(("assistant", parts[0]))
+    for i in range(1, len(parts), 2):
+        role = parts[i]
+        text = parts[i + 1] if i + 1 < len(parts) else ""
+        segments.append((role, text))
+    # Keep only assistant segments; flag the final segment of the whole
+    # response (regardless of role) so that an unclosed <answer> in a
+    # segment terminated by an env turn can be accepted, while an
+    # unclosed <answer> at the very tail is still treated strictly.
+    last_idx = len(segments) - 1
+    return [
+        (text, i == last_idx)
+        for i, (role, text) in enumerate(segments)
+        if role == "assistant"
+    ]
+
+
+def _extract_submit_answer_tool_call(content: str) -> str | None:
+    """Extract answer from a submit_answer tool call in hermes format.
+
+    Args:
+        content: Text potentially containing a
+            ``<tool_call>{"name": "submit_answer", ...}</tool_call>`` block.
+
+    Returns:
+        Answer string if a valid submit_answer call is found, None otherwise.
+    """
+    for match in TOOL_CALL_PATTERN.finditer(content):
+        try:
+            tc = json.loads(match.group(1).strip())
+            if (
+                isinstance(tc, dict)
+                and tc.get("name") == "submit_answer"
+                and isinstance(tc.get("arguments"), dict)
+            ):
+                answer = tc["arguments"].get("answer", "").strip()
+                if answer:
+                    return answer
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+    return None
+
+
+def _extract_answer(content: str) -> tuple[str | None, List[str]]:
+    """Extract answer from <answer> tags.
+
+    Args:
+        content: The text to extract the answer from.
+
+    Returns:
+        Tuple of (extracted answer or None, list of errors).
+    """
+    errors: List[str] = []
+    segments = _iter_assistant_segments(content)
+
+    # Walk assistant segments in order, tracking the most recent answer.
+    # A segment contributes:
+    #   1. Every closed <answer>...</answer> match in order (last wins).
+    #   2. An unclosed trailing <answer> if and only if the segment is
+    #      NOT the final segment of the response (i.e., it was terminated
+    #      by an env/user turn), under the assumption that the model
+    #      dumped its answer and the rollout cut in before it could close
+    #      the tag.
+    last_answer: str | None = None
+    has_any_open = False
+    for seg_text, is_last in segments:
+        if "<answer>" in seg_text:
+            has_any_open = True
+        closed = ANSWER_PATTERN.findall(seg_text)
+        if closed:
+            last_answer = closed[-1]
+        if not is_last:
+            # Look for an unclosed <answer> after the last closed match.
+            tail_start = 0
+            last_close = seg_text.rfind("</answer>")
+            if last_close != -1:
+                tail_start = last_close + len("</answer>")
+            orphan_idx = seg_text.find("<answer>", tail_start)
+            if orphan_idx != -1:
+                last_answer = seg_text[orphan_idx + len("<answer>") :]
+
+    if last_answer is None:
+        # Fallback: submit_answer tool call (hermes format) inside any
+        # assistant segment.
+        for seg_text, _ in segments:
+            tc_answer = _extract_submit_answer_tool_call(seg_text)
+            if tc_answer is not None:
+                return tc_answer, errors
+        if has_any_open:
+            errors.append("Unclosed <answer> tag")
+        return None, errors
+
+    answer = last_answer.strip()
+    if not answer:
+        errors.append("Empty <answer> tag")
+        return None, errors
+
+    return answer, errors
+
+
+def _extract_thinking_blocks(content: str) -> List[str]:
+    """Extract all thinking blocks from <think> tags.
+
+    Args:
+        content: The text to extract thinking blocks from.
+
+    Returns:
+        List of thinking block contents in order of appearance.
+    """
+    matches = THINK_PATTERN.findall(content)
+    return [match.strip() for match in matches if match.strip()]
+
+
+def _extract_tool_calls(content: str) -> List[str]:
+    """Extract all tool call blocks from <tool_call> tags.
+
+    Args:
+        content: The text to extract tool calls from.
+
+    Returns:
+        List of raw tool call contents in order of appearance.
+    """
+    matches = TOOL_CALL_PATTERN.findall(content)
+    return [match.strip() for match in matches if match.strip()]
+
+
+def _extract_search_queries(content: str) -> List[str]:
+    """Extract all search queries from <search> tags (search_r1 format).
+
+    Args:
+        content: The text to extract search queries from.
+
+    Returns:
+        List of search query strings in order of appearance.
+    """
+    matches = SEARCH_R1_PATTERN.findall(content)
+    return [match.strip() for match in matches if match.strip()]
+
+
+def _extract_fc_search_queries(content: str) -> List[str]:
+    """Extract search queries from ``<function_calls>search(query="...")`` patterns.
+
+    Args:
+        content: The text to extract function_calls search queries from.
+
+    Returns:
+        List of search query strings in order of appearance.
+    """
+    matches = FC_SEARCH_PATTERN.findall(content)
+    return [match.strip() for match in matches if match.strip()]
+
+
+def _extract_fc_answer(content: str) -> tuple[str | None, List[str]]:
+    """Extract answer from ``<function_calls>answer(answer="...")`` pattern.
+
+    Args:
+        content: The text to extract the function_calls answer from.
+
+    Returns:
+        Tuple of (extracted answer or None, list of errors).
+    """
+    errors: List[str] = []
+    match = FC_ANSWER_PATTERN.search(content)
+    if not match:
+        if "<function_calls>" in content and "answer(" in content:
+            errors.append("Malformed answer function call")
+        return None, errors
+    answer = match.group(1).strip()
+    if not answer:
+        errors.append("Empty answer function call")
+        return None, errors
+    return answer, errors
+
+
+def _extract_webthinker_queries(content: str) -> List[str]:
+    """Extract search queries from ``<|begin_search_query|>...<|end_search_query|>`` patterns.
+
+    Args:
+        content: The text to extract WebThinker queries from.
+
+    Returns:
+        List of query strings in order of appearance.
+    """
+    matches = WEBTHINKER_SEARCH_PATTERN.findall(content)
+    return [match.strip() for match in matches if match.strip()]
+
+
+def _extract_webexplorer_queries(content: str) -> List[str]:
+    """Extract search queries from WebExplorer ``<tool_call>`` JSON format.
+
+    Handles ``search`` tool (extracts ``queries`` list) and ``browse``
+    tool (extracts ``query`` string).
+
+    Args:
+        content: The text to extract WebExplorer queries from.
+
+    Returns:
+        List of query strings in order of appearance.
+    """
+    results: List[str] = []
+    for match in WEBEXPLORER_TOOL_CALL_PATTERN.finditer(content):
+        raw = match.group(1).strip()
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        name = parsed.get("name")
+        args = parsed.get("arguments", {})
+        if not isinstance(args, dict):
+            continue
+        if name == "search":
+            queries = args.get("queries", [])
+            if isinstance(queries, list):
+                results.extend(q for q in queries if isinstance(q, str) and q.strip())
+        elif name == "browse":
+            query = args.get("query", "")
+            if isinstance(query, str) and query.strip():
+                results.append(query.strip())
+    return results
+
+
+def _extract_boxed_answer(content: str) -> str | None:
+    """Extract the last ``\\boxed{...}`` answer from text.
+
+    Args:
+        content: The text to extract the boxed answer from.
+
+    Returns:
+        Answer string or None if not found.
+    """
+    matches = BOXED_ANSWER_PATTERN.findall(content)
+    if matches:
+        answer = matches[-1].strip()
+        return answer if answer else None
+    return None
+
+
+def _extract_call_tool_queries(content: str) -> List[str]:
+    """Extract search queries from ``<call_tool name="...">query</call_tool>`` patterns.
+
+    Args:
+        content: The text to extract call_tool queries from.
+
+    Returns:
+        List of query strings in order of appearance.
+    """
+    matches = CALL_TOOL_SEARCH_PATTERN.findall(content)
+    return [match.strip() for match in matches if match.strip()]
+
+
+def parse_solver_response(content: str) -> SolverParseResult:
+    """Parse a solver model response and extract structured information.
+
+    Extracts the answer, thinking blocks, and tool calls from a solver's
+    response. The solver format uses:
+    - <think>...</think> for reasoning steps
+    - <tool_call>...</tool_call> for search requests
+    - <answer>...</answer> for the final answer
+
+    Args:
+        content: The raw solver response text.
+
+    Returns:
+        SolverParseResult containing extracted information and any errors.
+
+    Examples:
+        >>> result = parse_solver_response(
+        ...     "<think>Let me search.</think>"
+        ...     "<tool_call>{...}</tool_call>"
+        ...     "<answer>Paris</answer>"
+        ... )
+        >>> result.is_valid
+        True
+        >>> result.answer
+        'Paris'
+    """
+    if not content:
+        return SolverParseResult(
+            raw_response="",
+            errors=["Empty response"]
+        )
+
+    errors = []
+
+    # Extract answer
+    answer, answer_errors = _extract_answer(content)
+    errors.extend(answer_errors)
+
+    # Extract thinking blocks
+    thinking_blocks = _extract_thinking_blocks(content)
+
+    # Extract tool calls
+    tool_calls = _extract_tool_calls(content)
+
+    # Extract search queries (search_r1 format)
+    search_queries = _extract_search_queries(content)
+
+    # Extract function_calls search queries
+    fc_search_queries = _extract_fc_search_queries(content)
+    search_queries.extend(fc_search_queries)
+
+    # Extract call_tool search queries (DR-Tulu format)
+    ct_queries = _extract_call_tool_queries(content)
+    search_queries.extend(ct_queries)
+
+    # Extract WebThinker search queries
+    wt_queries = _extract_webthinker_queries(content)
+    search_queries.extend(wt_queries)
+
+    # Extract WebExplorer search queries
+    we_queries = _extract_webexplorer_queries(content)
+    search_queries.extend(we_queries)
+
+    # Try function_calls answer if no XML answer found
+    if answer is None and not errors:
+        fc_answer, fc_errors = _extract_fc_answer(content)
+        if fc_answer is not None:
+            answer = fc_answer
+        errors.extend(fc_errors)
+
+    # Try \boxed{} answer as final fallback (WebThinker format)
+    if answer is None and not errors:
+        boxed_answer = _extract_boxed_answer(content)
+        if boxed_answer is not None:
+            answer = boxed_answer
+
+    return SolverParseResult(
+        answer=answer,
+        thinking_blocks=thinking_blocks,
+        tool_calls=tool_calls,
+        search_queries=search_queries,
+        raw_response=content,
+        errors=errors,
+    )
+
+
+def parse_final_answer_only(content: str) -> str | None:
+    """Extract only the answer from a solver response.
+
+    Convenience function when only the answer is needed without full parsing.
+
+    Args:
+        content: The raw solver response text.
+
+    Returns:
+        The extracted answer string, or None if not found.
+    """
+    matches = ANSWER_PATTERN.findall(_strip_env_turns(content))
+    if matches:
+        answer = matches[-1].strip()
+        return answer if answer else None
+    return None

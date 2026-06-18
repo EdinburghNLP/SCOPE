@@ -1,0 +1,56 @@
+You will see ONLY a task prompt. Grade it for entity identifiability.
+
+Rubric:
+Score 1 if a researcher could find the right person, place, work, or concept from what's written — even if they'd never heard of it before.
+Score 0 only if a central entity is genuinely ambiguous — the name alone refers to many well-known things and the task gives no context to distinguish them.
+
+Key principle: Context resolves ambiguity. A name that could be ambiguous in isolation often becomes clear from the task itself. "John Smith" alone is ambiguous, but "John Smith's role in the Jamestown colony" is not. Judge the full task, not names in isolation.
+
+When to PASS (score 1):
+- The task's context (topic, domain, time period, related entities) makes it clear which person/place/work is meant
+- Named creative works (books, films, shows, plays) in quotes or with enough context
+- Full organization, institution, or place names
+- Named historical concepts, legal doctrines, scientific terms, or events
+- Well-known acronyms (MIT, NASA, ADA) or acronyms with the full name also provided
+
+When to FAIL (score 0):
+- Any name — even a full name — that lacks disambiguating context (e.g., "Michael Johnson" with no domain, field, or time period)
+- An obscure unexpanded acronym with no full name (e.g., "ITA" alone)
+- Completely generic references with no proper noun ("the coach", "the team")
+
+Output format (MANDATORY — follow exactly):
+1. Wrap your reasoning in <think>...</think> tags
+2. Then output your score in <score>...</score> tags — ONLY 0 or 1, nothing else
+
+[EXAMPLE 1 — PASS]
+<task_prompt>Create a career timeline for Scottish football manager Alex Totten.</task_prompt>
+<think>"Alex Totten" + "Scottish football manager" — domain narrows to one person. Identifiable.</think>
+<score>1</score>
+
+[EXAMPLE 2 — PASS]
+<task_prompt>How did Chris Murphy's stance on oil drilling evolve during his Senate career?</task_prompt>
+<think>"Chris Murphy" is a common name, but "Senate career" + "oil drilling" narrows this to the U.S. Senator. Context disambiguates. Identifiable.</think>
+<score>1</score>
+
+[EXAMPLE 3 — PASS]
+<task_prompt>Summarize key characters, setting, and plot of "Smackout".</task_prompt>
+<think>"Smackout" is a specific titled work. Identifiable.</think>
+<score>1</score>
+
+[EXAMPLE 4 — PASS]
+<task_prompt>Analyze the Long Beach City School District's autonomy and special programs.</task_prompt>
+<think>"Long Beach City School District" is a full organization name. Identifiable.</think>
+<score>1</score>
+
+[EXAMPLE 5 — FAIL]
+<task_prompt>Summarize Michael Johnson's major career achievements.</task_prompt>
+<think>"Michael Johnson" is a common full name — could be the sprinter, the guitarist, or many others. No domain or context to disambiguate. Not identifiable.</think>
+<score>0</score>
+
+[EXAMPLE 6 — FAIL]
+<task_prompt>Describe ITA's recent initiatives.</task_prompt>
+<think>"ITA" is an unexpanded acronym — could be many organizations. Not identifiable.</think>
+<score>0</score>
+
+Now grade:
+<task_prompt>{task_prompt}</task_prompt>

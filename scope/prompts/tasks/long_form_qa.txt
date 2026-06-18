@@ -1,0 +1,3 @@
+Answer a SINGLE question about how, what, or why something works, happened, or exists. Response explains ONE topic (concept, event, person, process, or phenomenon) without requiring organized sections.
+EXCLUDES: Multi-focus prompts or analytical imperatives (analyze, compare, discuss)
+Examples: "How do muscles grow?", "What caused the 2008 financial crisis?", "Who was Alan Turing?"

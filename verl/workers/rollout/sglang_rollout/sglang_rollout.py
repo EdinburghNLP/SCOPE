@@ -1,0 +1,2390 @@
+# Copyright 2023-2024 SGLang Team
+# Copyright 2025 ModelBest Inc. and/or its affiliates
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import multiprocessing as mp
+import os
+import re
+import time
+from copy import deepcopy
+from json import JSONDecodeError
+from typing import Any, List, Optional, Tuple
+from uuid import uuid4
+
+import numpy as np
+import sglang.srt.entrypoints.engine
+import torch
+import torch.distributed as dist
+from omegaconf import DictConfig
+try:
+    from sglang.srt.managers.io_struct import (
+        ReleaseMemoryOccupationReqInput,
+        ResumeMemoryOccupationReqInput,
+        UpdateWeightsFromTensorReqInput,
+    )
+except ImportError:
+    from sglang.srt.managers.tokenizer_manager import (
+        ReleaseMemoryOccupationReqInput,
+        ResumeMemoryOccupationReqInput,
+        UpdateWeightsFromTensorReqInput,
+    )
+
+try:
+    from sglang.srt.managers.io_struct import (
+        ContinueGenerationReqInput,
+        PauseGenerationReqInput,
+    )
+except ImportError:
+    PauseGenerationReqInput = None
+    ContinueGenerationReqInput = None
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import (
+    MultiprocessingSerializer,
+    assert_pkg_version,
+    get_open_port,
+    is_cuda,
+    set_prometheus_multiproc_dir,
+    set_ulimit,
+)
+try:
+    from sglang.srt.utils import get_ip
+except ImportError:
+    from sglang.srt.utils import get_local_ip_auto as get_ip
+
+try:
+    from sglang.srt.utils import maybe_set_triton_cache_manager
+except ImportError:
+    maybe_set_triton_cache_manager = lambda: None
+from tensordict import TensorDict
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.nn.utils.rnn import pad_sequence
+from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast, ProcessorMixin
+
+from verl import DataProto
+from verl.interactions.base import BaseInteraction
+from verl.interactions.utils.interaction_registry import initialize_interactions_from_config
+from verl.third_party.sglang import parallel_state as sglang_ps
+from verl.tools.base_tool import BaseTool
+from verl.tools.schemas import (
+    OpenAIFunctionCallSchema,
+    OpenAIFunctionParametersSchema,
+    OpenAIFunctionParsedSchema,
+    OpenAIFunctionPropertySchema,
+    OpenAIFunctionSchema,
+    OpenAIFunctionToolCall,
+    OpenAIFunctionToolSchema,
+)
+from verl.tools.utils.tool_registry import initialize_tools_from_config
+from verl.utils.net_utils import is_ipv6
+from verl.utils.profiler import GPUMemoryLogger
+from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
+from verl.workers.rollout.base import BaseRollout
+from verl.workers.rollout.schemas import (
+    AsyncRolloutRequest,
+    AsyncRolloutRequestStateEnum,
+    FinishReasonTypeEnum,
+    Message,
+)
+from verl.workers.rollout.sglang_rollout.utils import broadcast_pyobj
+
+try:
+    from sglang.srt.function_call.function_call_parser import FunctionCallParser
+except ImportError:
+    from sglang.srt.function_call_parser import FunctionCallParser
+
+try:
+    from sglang.srt.entrypoints.openai.protocol import Tool
+except ImportError:
+    from sglang.srt.openai_api.protocol import Tool
+
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+# Simplified search tool schema for the function_calls format.
+# The actual SearchTool uses query_list (array) but the function_calls
+# format exposes a single-query interface: search(query="...").
+# Injected into the chat template so OLMo's system prompt includes
+# function-calling instructions and the <function_calls> tag format.
+_FC_SEARCH_TOOL_SCHEMA = OpenAIFunctionToolSchema(
+    type="function",
+    function=OpenAIFunctionSchema(
+        name="search",
+        description="Search the web for relevant information based on the given query.",
+        parameters=OpenAIFunctionParametersSchema(
+            type="object",
+            properties={
+                "query": OpenAIFunctionPropertySchema(
+                    type="string",
+                    description="The search query.",
+                ),
+            },
+            required=["query"],
+        ),
+    ),
+)
+
+_FC_TASK_TOOL_SCHEMA = OpenAIFunctionToolSchema(
+    type="function",
+    function=OpenAIFunctionSchema(
+        name="task",
+        description=(
+            "Submit the final task after completing all search turns. "
+            "Call this exactly once as your final action."
+        ),
+        parameters=OpenAIFunctionParametersSchema(
+            type="object",
+            properties={
+                "task_prompt": OpenAIFunctionPropertySchema(
+                    type="string",
+                    description="The task prompt for the solver.",
+                ),
+            },
+            required=["task_prompt"],
+        ),
+    ),
+)
+
+_FC_ANSWER_TOOL_SCHEMA = OpenAIFunctionToolSchema(
+    type="function",
+    function=OpenAIFunctionSchema(
+        name="answer",
+        description=(
+            "Submit the final answer to the question. "
+            "Call this exactly once as your final action."
+        ),
+        parameters=OpenAIFunctionParametersSchema(
+            type="object",
+            properties={
+                "answer": OpenAIFunctionPropertySchema(
+                    type="string",
+                    description="The answer to the question.",
+                ),
+            },
+            required=["answer"],
+        ),
+    ),
+)
+
+_FC_TOOL_REGISTRY: dict[str, OpenAIFunctionToolSchema] = {
+    "search": _FC_SEARCH_TOOL_SCHEMA,
+    "task": _FC_TASK_TOOL_SCHEMA,
+    "answer": _FC_ANSWER_TOOL_SCHEMA,
+}
+
+
+# patch to avoid issue https://github.com/sgl-project/sglang/issues/6723
+def _set_envs_and_config(server_args: ServerArgs):
+    # Set global environments
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
+    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
+    os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+
+    # Set prometheus env vars
+    if server_args.enable_metrics:
+        set_prometheus_multiproc_dir()
+
+    # Set ulimit
+    set_ulimit()
+
+    # Fix triton bugs
+    if server_args.tp_size * server_args.dp_size > 1:
+        # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
+        maybe_set_triton_cache_manager()
+
+    # Check flashinfer version
+    if server_args.attention_backend == "flashinfer":
+        assert_pkg_version(
+            "flashinfer_python",
+            "0.2.5",
+            "Please uninstall the old version and reinstall the latest version by following the instructions at https://docs.flashinfer.ai/installation.html.",
+        )
+    if is_cuda():
+        assert_pkg_version(
+            "sgl-kernel",
+            "0.1.1",
+            "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
+        )
+
+    # Set mp start method
+    mp.set_start_method("spawn", force=True)
+
+
+sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
+
+
+# because chatCompletion is an async method, it makes the whole ray actor be an async actor
+# which can not call loop.run_until_complete. So we need to make the engine to be an async class
+class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # default to use dummy load format, which need to reload weights in first time
+        self._need_reload = True
+
+    async def release_memory_occupation(self, tags: Optional[list[str]] = None):
+        """Release GPU occupation temporarily.
+
+        Uses SGLang's pause_generation(mode="retract") API to properly drain the
+        overlap scheduler before releasing memory. This pauses the engine, drains
+        last_batch/result_queue, calls filter_batch() to remove finished requests
+        from running_batch, and retracts any remaining requests — satisfying all
+        _is_no_request() conditions and preventing the assertion failure.
+
+        Args:
+            tags: Optional list of memory tags to release.
+
+        Returns:
+            The result from the tokenizer manager's release_memory_occupation.
+        """
+        if PauseGenerationReqInput is not None:
+            await self.tokenizer_manager.pause_generation(
+                PauseGenerationReqInput(mode="retract")
+            )
+        obj = ReleaseMemoryOccupationReqInput(tags=tags) if tags else ReleaseMemoryOccupationReqInput()
+        return await self.tokenizer_manager.release_memory_occupation(obj, None)
+
+    async def resume_memory_occupation(self, tags: Optional[list[str]] = None):
+        """Resume GPU occupation and unpause the scheduler.
+
+        After resuming memory, calls continue_generation() to unpause the
+        scheduler that was paused by release_memory_occupation(). This is safe
+        even without a prior pause (continue_generation is a no-op when the
+        engine is not paused).
+
+        Args:
+            tags: Optional list of memory tags to resume.
+
+        Returns:
+            The result from the tokenizer manager's resume_memory_occupation.
+        """
+        # because __init__ is a sync method, it can not call the async release_memory_occupation
+        # have to move release_memory_occupation from __init__ to here
+        # For multi-stage awake, we run release weight and kv_cache when we resume weights for the first time.
+        if self._need_reload:
+            await self.release_memory_occupation()
+            self._need_reload = False
+
+        obj = ResumeMemoryOccupationReqInput(tags=tags) if tags else ResumeMemoryOccupationReqInput()
+        result = await self.tokenizer_manager.resume_memory_occupation(obj, None)
+        if ContinueGenerationReqInput is not None:
+            await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
+        return result
+
+    async def update_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],  # noqa: UP006
+        load_format: Optional[str] = None,
+        flush_cache: bool = True,
+    ):
+        """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
+        to avoid duplicated cache cleaning operation."""
+        obj = UpdateWeightsFromTensorReqInput(
+            serialized_named_tensors=[
+                MultiprocessingSerializer.serialize(named_tensors) for _ in range(self.server_args.tp_size)
+            ],
+            load_format=load_format,
+            flush_cache=flush_cache,
+        )
+        return await self.tokenizer_manager.update_weights_from_tensor(obj, None)
+
+    async def flush_cache(self):
+        return await self.tokenizer_manager.flush_cache()
+
+
+# NOTE(sgm): add for verl. We can optimize it by making
+#  the dataloader yield List[int] without padding.
+def _pre_process_inputs(
+    pad_token_id,
+    prompt_token_ids: torch.Tensor,
+) -> torch.Tensor:
+    # remove the left padding in the prompt token_id
+    non_pad_index = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)[0][0]
+    return prompt_token_ids[non_pad_index:]
+
+
+# NOTE(linjunrong): adhoc
+def _post_process_outputs(processing_class, output):
+    try:
+        # This is when processing_class is a processor
+        tokenizer = processing_class.tokenizer
+    except AttributeError:
+        try:
+            # This is when processing_class is a tokenizer
+            tokenizer = processing_class
+        except AttributeError as e:
+            raise ValueError(f"Cannot get tokenizer from processing_class {processing_class}") from e
+
+    def _map_each_response(resp):
+        output_token_logprobs = resp["meta_info"]["output_token_logprobs"]
+        log_probs, output_token_ids = zip(
+            *[(log_prob, token_ids) for log_prob, token_ids, _ in output_token_logprobs], strict=True
+        )
+        return torch.tensor(output_token_ids), torch.tensor(log_probs)
+
+    out_map = map(lambda x: _map_each_response(x), output)
+    batched_output_token_ids = []
+    batched_logprobs = []
+    for output_token_ids, log_probs in out_map:
+        batched_output_token_ids.append(output_token_ids)
+        batched_logprobs.append(log_probs)
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    batched_output_token_ids = pad_sequence(batched_output_token_ids, batch_first=True, padding_value=pad_token_id)
+    if len(batched_logprobs) > 0:
+        batched_logprobs = pad_sequence(batched_logprobs, batch_first=True, padding_value=pad_token_id)
+    return batched_output_token_ids, batched_logprobs
+
+
+def get_tool_call_parser_type(
+    processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin,
+    preferred_type: str | None = None,
+) -> str:
+    """Select the tool call parser type for the given tokenizer.
+
+    Args:
+        processing_class: Tokenizer or processor whose vocabulary is checked
+            against each parser's bot/eot tokens.
+        preferred_type: If set and valid (a key in
+            ``FunctionCallParser.ToolCallParserEnum``), return it directly,
+            bypassing auto-detection.  Use this to override cases where
+            auto-detection picks the wrong parser (e.g. ``"glm"`` instead of
+            ``"qwen25"`` for Qwen3).
+
+    Returns:
+        The parser type string (e.g. ``"qwen25"``, ``"glm"``).
+
+    Raises:
+        ValueError: If *preferred_type* is not a recognised parser type, or if
+            auto-detection finds no matching parser.
+    """
+    if preferred_type is not None:
+        valid_types = FunctionCallParser.ToolCallParserEnum
+        if preferred_type not in valid_types:
+            raise ValueError(
+                f"preferred_type={preferred_type!r} is not a valid tool call "
+                f"parser type. Valid types: {list(valid_types.keys())}"
+            )
+        return preferred_type
+
+    items = FunctionCallParser.ToolCallParserEnum.items()
+    for parser_type, parser_cls in items:
+        parser = parser_cls()
+        try:
+            # This is when processing_class is a tokenizer
+            tokenizer_vocab = processing_class.get_vocab()
+        except AttributeError:
+            try:
+                # This is when processing_class is a processor
+                tokenizer_vocab = processing_class.tokenizer.get_vocab()
+            except AttributeError as e:
+                raise ValueError(f"Cannot get vocab from processing_class {processing_class}") from e
+
+        if parser.bot_token.strip() in tokenizer_vocab and (
+            parser.eot_token == "" or parser.eot_token.strip() in tokenizer_vocab
+        ):
+            return parser_type
+    else:
+        raise ValueError(f"No tool call parser found for processing_class {processing_class}")
+
+
+class SGLangRollout(BaseRollout):
+    _FORCE_ANSWER_NUDGE = (
+        "You have used all your search attempts. "
+        "You must now provide your final answer. "
+        "Wrap it in <answer> and </answer> tags."
+    )
+    _FORCE_ANSWER_NUDGE_FC = (
+        "You have used all your search attempts. "
+        "You must now provide your final answer by calling the answer function."
+    )
+    _MAX_FORCE_ANSWER_RETRIES = 5
+    _INVALID_ACTION_MESSAGE = (
+        "My previous action is invalid. If I want to search, I should put the query "
+        "between <search> and </search>. If I want to give the final answer, I should "
+        "put the answer between <answer> and </answer>. Let me try again."
+    )
+    _INVALID_ACTION_MESSAGE_FC = (
+        "My previous action is invalid. I must use the correct function call syntax. "
+        "I should wrap my function call inside <function_calls> and </function_calls> tags. "
+        "For searching: search(query=\"my query\"). "
+        "For submitting the task: task(task_prompt=\"...\"). "
+        "Let me try again with the correct format."
+    )
+    _INVALID_ACTION_MESSAGE_TC = (
+        "My previous action is invalid. I must generate a valid tool call with "
+        "proper JSON inside <tool_call> and </tool_call> tags. "
+        "Let me try again with the correct format."
+    )
+    _INVALID_ACTION_MESSAGE_FC_XML = (
+        "Your last response did not contain a valid action. "
+        "To search, use <function_calls>search(query=\"your query\")</function_calls>. "
+        "To submit the final output, use <answer>...</answer> or <task>...</task> tags. "
+        "Please try again with the correct format."
+    )
+
+    def __init__(
+        self,
+        actor_module: str,
+        config: DictConfig,
+        processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin,
+        model_hf_config,
+        port=None,
+        trust_remote_code: bool = False,
+        device_mesh: DeviceMesh | None = None,
+        **kwargs,
+    ):
+        """Synchronized SGLang rollout engine.
+
+        Args:
+            actor_module: Huggingface model name or path to the model. The
+                model should be supported by SGLang.
+            config: A DictConfig object containing SGLang-specific operational
+                parameters and rollout settings.
+                Refer to https://docs.sglang.ai/backend/server_arguments.html
+            processing_class: The tokenizer or processor instance compatible with the actor_module.
+            model_hf_config: The Hugging Face model's configuration (e.g.,
+                `transformers.PretrainedConfig`). It provides architectural
+                details and hyperparameters like `max_position_embeddings`,
+                used by SGLang for correct model initialization. This is
+                the model's inherent design, not SGLang's runtime behavior.
+            port: Optional port for multi-node initialization when nnodes > 1.
+            trust_remote_code: Whether or not to allow for custom models
+                defined on the Hub in their own modeling files.
+            device_mesh: Optional `DeviceMesh` object for distributed setup.
+            **kwargs: Additional keyword arguments, primarily `train_tp` for
+                Megatron Backend integration to initialize hybrid engine
+                process groups.
+        """
+        super().__init__()
+        self.config = config
+        self._device_mesh_cpu = device_mesh
+        os.environ.setdefault("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK", "true")
+
+        self._multi_turn_format = getattr(config.multi_turn, "format", None)
+        # Dynamic user turn messages (challenger v10): after_search + final
+        # merged into <information> content, matching create_task.py behavior.
+        _dut_raw = getattr(config.multi_turn, "dynamic_user_turns", False)
+        # Accept bool, int (1/0), or string ("true"/"1") from hydra overrides
+        self._dynamic_user_turns = str(_dut_raw).lower() in ("true", "1", "yes")
+        self._dynamic_style = getattr(config.multi_turn, "dynamic_style", "chain2")
+        _fc_names_raw = getattr(config.multi_turn, "fc_tool_names", None)
+        if _fc_names_raw is not None:
+            if isinstance(_fc_names_raw, str):
+                self._fc_tool_names = [s.strip() for s in _fc_names_raw.split(",") if s.strip()]
+            else:
+                self._fc_tool_names = list(_fc_names_raw)
+        else:
+            self._fc_tool_names = None
+        self._dynamic_msgs: dict[str, str] | None = None
+        if self._dynamic_user_turns:
+            from scope.create_task import DYNAMIC_STYLES
+            self._dynamic_msgs = DYNAMIC_STYLES.get(self._dynamic_style)
+        (
+            self._tool_schemas,
+            self._tool_map,
+            self._tool_call_parser_type,
+            self._sgl_tools,
+            self._function_call_parser,
+        ) = self._initialize_tools(config, processing_class)
+        self.interaction_map: dict[str, BaseInteraction] = self._initialize_interactions(config)
+        # If turn on `free_cache_engine`, SGLang engine's KV cache
+        # will be freed after each `generate_sequences` call.
+        logger.info(
+            f"tool_schemas: {self._tool_schemas}, tool_map: {self._tool_map}, tool_call_parser_type: "
+            f"{self._tool_call_parser_type}, sgl_tools: {self._sgl_tools}, function_call_parser: "
+            f"{self._function_call_parser}"
+        )
+
+        self._init_distributed_env(device_mesh_cpu=device_mesh, **kwargs)
+
+        self._verify_config(model_hf_config=model_hf_config)
+        # initialize the inference engine
+        self._init_inference_engine(trust_remote_code, actor_module, port)
+
+        self._init_sampling_params(**kwargs)
+
+        self.processing_class = processing_class
+
+        try:
+            # This is when processing_class is a tokenizer
+            self.pad_token_id = self.processing_class.pad_token_id
+        except AttributeError:
+            try:
+                # This is when processing_class is a processor
+                self.pad_token_id = self.processing_class.tokenizer.pad_token_id
+            except AttributeError as e:
+                raise ValueError(f"Cannot get pad_token_id from processing_class {self.processing_class}") from e
+
+    def _init_distributed_env(self, device_mesh_cpu, **kwargs):
+        self._device_mesh_cpu = device_mesh_cpu
+        os.environ.setdefault("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK", "true")
+        self.tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
+        assert self.tensor_parallel_size <= dist.get_world_size(), (
+            "tensor parallel size should be less than or equal to the world size"
+        )
+        self.train_tp = kwargs.get("train_tp", None)
+        if self.train_tp is not None:
+            # deployed with megatron
+            os.environ["CUDA_TIMER_STREAM_KAFKA_ENABLE"] = "0"
+            os.environ["MEGATRON_IMPORT_TIMERS"] = "0"
+            train_tp = kwargs.get("train_tp", None)
+            num_tp_per_train_tp = train_tp // self.tensor_parallel_size
+            sglang_ps.initialize_parallel_state(
+                tensor_model_parallel_size=self.tensor_parallel_size,
+                num_tp_per_train_tp=num_tp_per_train_tp,
+            )
+
+        tp_size = self.tensor_parallel_size
+        world_size = int(os.getenv("WORLD_SIZE", "-1"))
+
+        # init device mesh
+        if self._device_mesh_cpu is None:
+            device_mesh_kwargs = dict(
+                mesh_shape=(world_size // tp_size, tp_size, 1),
+                mesh_dim_names=["dp", "tp", "pp"],
+            )
+
+            self._device_mesh_cpu = init_device_mesh("cpu", **device_mesh_kwargs)
+
+        self._rank = self._device_mesh_cpu.get_rank()
+        self._tp_rank = self._device_mesh_cpu["tp"].get_local_rank()
+        self._tp_size = self._device_mesh_cpu["tp"].size()
+        if self._rank == 0:
+            logger.info(f"_init_distributed_env: :tp_world: {self._tp_size}, global_world: {world_size}")
+        # get tp_rank of this process in this tp group
+        visible_devices = [None] * self._device_mesh_cpu.size(1)
+
+        torch.distributed.all_gather_object(
+            visible_devices, os.environ["CUDA_VISIBLE_DEVICES"], self._device_mesh_cpu.get_group("tp")
+        )
+        self.visible_devices_set = set(",".join(visible_devices).split(","))
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(list(self.visible_devices_set)))
+
+    def _verify_config(self, model_hf_config):
+        if not self.config.get("max_model_len", None):
+            self.config.max_model_len = self.config.prompt_length + self.config.response_length
+        assert (
+            self.config.max_model_len >= self.config.prompt_length + self.config.response_length
+        ), f"""max_model_len should be greater than total sequence length (prompt_length + response_length): 
+            {self.config.max_model_len} >= {self.config.prompt_length} + {self.config.response_length}"""
+        max_position_embeddings = None
+        if hasattr(model_hf_config, "max_position_embeddings"):
+            max_position_embeddings = model_hf_config.max_position_embeddings
+        elif hasattr(model_hf_config, "llm_config") and hasattr(model_hf_config.llm_config, "max_position_embeddings"):
+            max_position_embeddings = model_hf_config.llm_config.max_position_embeddings
+        elif hasattr(model_hf_config, "text_config") and hasattr(
+            model_hf_config.text_config, "max_position_embeddings"
+        ):
+            max_position_embeddings = model_hf_config.text_config.max_position_embeddings
+        if max_position_embeddings is None:
+            raise ValueError("max_position_embeddings not found in model_hf_config")
+        rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
+        if not rope_scaling_config:
+            assert max_position_embeddings >= self.config.prompt_length + self.config.response_length, (
+                "model context length should be greater than total sequence length"
+            )
+        else:
+            # handle type where there's a length extend factor
+            # see https://qwen.readthedocs.io/en/latest/deployment/vllm.html#extended-context-support
+            # for using yarn as an example
+            rope_scaling_factor = rope_scaling_config.get("factor", 1.0)
+
+            assert (
+                model_hf_config.max_position_embeddings * rope_scaling_factor
+                >= self.config.prompt_length + self.config.response_length
+            ), (
+                f"model context length should be greater than total sequence length, "
+                f"got rope_scaling_factor={rope_scaling_factor} and "
+                f"max_position_embeddings={model_hf_config.max_position_embeddings}"
+            )
+
+        # currently max_assistant_turns stand for max number of tool calls
+        if self.config.multi_turn.max_assistant_turns is None:
+            self.config.multi_turn.max_assistant_turns = self.config.max_model_len // 3
+        if self.config.multi_turn.max_user_turns is None:
+            self.config.multi_turn.max_user_turns = self.config.max_model_len // 3
+
+    def _init_inference_engine(self, trust_remote_code, actor_module, port):
+        # initialize the inference engine
+        nnodes = -(-self._tp_size // len(self.visible_devices_set))
+        if nnodes > 1:
+            ip = get_ip()
+            port = get_open_port() if port is None else port
+            [ip, port] = broadcast_pyobj(
+                [ip, port],
+                rank=self._rank,
+                dist_group=self._device_mesh_cpu.get_group("tp"),
+                src=self._device_mesh_cpu["tp"].mesh[0].item(),
+                force_cpu_device=False,
+            )
+            dist_init_addr = f"[{ip}]:{port}" if is_ipv6(ip) else f"{ip}:{port}"
+        else:
+            dist_init_addr = None
+
+        load_format = "dummy" if self.config.load_format.startswith("dummy") else self.config.load_format
+        tp_size_per_node = self._tp_size // nnodes
+        node_rank = self._tp_rank // tp_size_per_node
+        first_rank_in_node = self._tp_rank % tp_size_per_node == 0
+
+        if first_rank_in_node:
+            rank = dist.get_rank()
+            os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
+            self._engine = AsyncEngine(
+                model_path=actor_module,
+                dtype=self.config.dtype,
+                mem_fraction_static=self.config.gpu_memory_utilization,
+                enable_memory_saver=True,
+                base_gpu_id=0,
+                gpu_id_step=1,
+                tp_size=self._tp_size,
+                node_rank=node_rank,
+                load_format=load_format,
+                dist_init_addr=dist_init_addr,
+                nnodes=nnodes,
+                trust_remote_code=trust_remote_code,
+                # NOTE(linjunrong): add rank to prevent SGLang generate same port inside PortArgs.init_new
+                # when random.seed is being set during training
+                port=30000 + rank,
+                # NOTE(Chenyang): if you want to debug the SGLang engine output
+                # please set the following parameters
+                # Otherwise, it will make the engine run too slow
+                # log_level="INFO",
+                # log_requests=True,
+                # log_requests_level=2,
+                # max_running_requests=1,
+                mm_attention_backend="fa3",
+                attention_backend="fa3",
+                # In async mode, we want token in token out.
+                skip_tokenizer_init=self.config.mode == "async",
+            )
+        else:
+            self._engine = None
+
+        self.sharding_manager = None
+        self.is_sleep = True
+
+    def _init_sampling_params(self, **kwargs):
+        kwargs = dict(
+            n=1,
+            max_new_tokens=self.config.response_length,
+            presence_penalty=0.0,
+            frequency_penalty=0.0,
+            repetition_penalty=1.0,
+        )
+        # supporting adding any sampling params from the config file
+        for k in self.config.keys():
+            if hasattr(SamplingParams(), str(k)) or "stop" in str(k):
+                kwargs[k] = self.config.get(k)
+        kwargs["n"] = 1  # already repeat in ray_trainer
+        self.sampling_params = kwargs
+
+    @staticmethod
+    def _as_stop_list(stop: Any) -> list[str]:
+        if stop is None:
+            return []
+        if isinstance(stop, str):
+            return [stop]
+        if isinstance(stop, (list, tuple)):
+            return [str(s) for s in stop]
+        return [str(stop)]
+
+    def _maybe_enable_no_stop_trim(self, sampling_params: dict[str, Any]) -> None:
+        """Enable `no_stop_trim` when stop strings are structural tags.
+
+        Many parts of the multi-turn pipeline rely on closing tags like
+        `</search>` / `</answer>` being present in the generated text. Some
+        backends trim stop strings from outputs by default; `no_stop_trim=True`
+        preserves them when the underlying SGLang version supports it.
+        """
+        if "no_stop_trim" in sampling_params:
+            return
+        if not hasattr(SamplingParams(), "no_stop_trim"):
+            return
+
+        stop_list = self._as_stop_list(sampling_params.get("stop"))
+        if not stop_list:
+            return
+
+        # Heuristic: if any stop string looks like an XML closing tag, keep it.
+        if any(isinstance(s, str) and s.strip().startswith("</") and s.strip().endswith(">") for s in stop_list):
+            sampling_params["no_stop_trim"] = True
+
+    @staticmethod
+    def _reappend_stop_tags_if_needed(text: str, stop: Any) -> str:
+        """Re-append closing tags that were used as stop strings and trimmed."""
+        stop_list = SGLangRollout._as_stop_list(stop)
+        if not stop_list or not text:
+            return text
+
+        stop_tag_pairs = [
+            ("</answer>", "<answer>"),
+            ("</tool_call>", "<tool_call>"),
+            ("</search>", "<search>"),
+            ("</task>", "<task>"),
+        ]
+        for close_tag, open_tag in stop_tag_pairs:
+            if close_tag in stop_list and open_tag in text and close_tag not in text:
+                text += close_tag
+        return text
+
+    def _initialize_tools(self, config, processing_class):
+        """Initialize tools from configuration.
+
+        Args:
+            config: Configuration object containing tool-related settings,
+                    specifically `config.multi_turn.tool_config_path`.
+            tokenizer: The tokenizer instance used for parsing tool calls from
+                       the model's generated text.
+
+        Returns:
+            tuple: A tuple containing:
+                - tool_schemas (list[dict]): OpenAI-formatted JSON schemas
+                  defining each tool's capabilities.
+                - tool_map (dict[str, BaseTool]): A dictionary mapping tool
+                  names to their executable `BaseTool` objects.
+                - tool_call_parser_type (str): The identifier for the specific
+                  parser type (e.g., 'json_mode', 'tool_code') used to extract
+                  tool calls.
+                - sgl_tools (list[sglang.srt.openai_api.protocol.Tool]): Tool
+                  definitions optimized for SGLang's internal engine.
+                - function_call_parser (sglang.srt.function_call_parser.FunctionCallParser):
+                  The active parser instance responsible for extracting
+                  structured tool calls from model outputs.
+        """
+        if config.multi_turn.tool_config_path is None:
+            return [], {}, None, [], None
+
+        tools_config_file = config.multi_turn.tool_config_path
+        tool_list = initialize_tools_from_config(tools_config_file)
+
+        logger.info(f"Initialize tools from configuration.: tool_list: {tool_list}")
+        from verl.tools.utils.tool_registry import SchemaOnlyTool
+        tool_schemas = [tool.get_openai_tool_schema().model_dump() for tool in tool_list]
+        # Exclude schema-only tools from tool_map so they are detected
+        # as terminal actions in the TOOL_CALLING handler.
+        tool_map = {
+            tool.name: tool for tool in tool_list
+            if not isinstance(tool, SchemaOnlyTool)
+        }
+        # Keep OpenAIFunctionToolSchema objects for ALL tools (including
+        # schema-only like submit_task/submit_answer) so they appear in
+        # the rendered tool list via apply_chat_template.
+        self._all_tool_schema_objects = [
+            tool.get_openai_tool_schema() for tool in tool_list
+        ]
+
+        # search_r1 and function_calls use regex-based tag detection, not
+        # FunctionCallParser.  Skip parser initialization to avoid ValueError
+        # on tokenizers (e.g. OLMo's GPT2TokenizerFast) that lack registered
+        # tool-call special tokens.
+        multi_turn_format = getattr(config.multi_turn, "format", None)
+        if multi_turn_format in ("search_r1", "function_calls", "function_calls_xml"):
+            return (tool_schemas, tool_map, None, [], None)
+
+        preferred_type = getattr(config.multi_turn, "tool_call_parser_type", None)
+        tool_call_parser_type = get_tool_call_parser_type(
+            processing_class, preferred_type=preferred_type
+        )
+        sgl_tools = [Tool.model_validate(tool_schema) for tool_schema in tool_schemas]
+        function_call_parser = FunctionCallParser(
+            sgl_tools,
+            tool_call_parser_type,
+        )
+
+        return (
+            tool_schemas,
+            tool_map,
+            tool_call_parser_type,
+            sgl_tools,
+            function_call_parser,
+        )
+
+    def _initialize_interactions(self, config):
+        """Initialize interactions from configuration.
+
+        Returns:
+            dict[str, BaseInteraction]: A dictionary mapping interaction names to interaction instances.
+        """
+        if config.multi_turn.interaction_config_path is None:
+            return {}
+
+        interaction_config_file = config.multi_turn.interaction_config_path
+        interaction_map = initialize_interactions_from_config(interaction_config_file)
+
+        logger.info(f"Initialize interactions from configuration: interaction_map: {list(interaction_map.keys())}")
+        return interaction_map
+
+    @GPUMemoryLogger(role="sglang rollout", logger=logger)
+    @torch.no_grad()
+    def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        """Generate sequences for a batch of prompts.
+
+        Args:
+            batch (DataProto): Input batch.
+
+        Returns:
+            DataProto: Output batch.
+            - prompts: [bsz, prompt_length], prompt token ids from dataset.
+            - responses: [bsz, response_length], output token ids include response tokens
+              from LLM generation and observation tokens from tool_calls.
+            - response_mask: [bsz, response_length], 1 for LLM generated tokens, 0 for observation/padding tokens.
+            - input_ids: [bsz, prompt_length + response_length], whole sequence token ids, including prompt tokens
+              and response tokens.
+            - attention_mask: [bsz, prompt_length + response_length], 0 for padding tokens, 1 for other tokens.
+            - position_ids: [bsz, prompt_length + response_length], incremental position ids.
+
+            For multi-turn conversations:
+            responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
+            response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
+        """
+        if self.config.multi_turn.enable:
+            return self._req_level_generate_sequences(prompts, **kwargs)
+        return self._batch_level_generate_sequences(prompts, **kwargs)
+
+    @GPUMemoryLogger(role="sglang rollout", logger=logger)
+    @torch.no_grad()
+    def _batch_level_generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        """Generates single-turn sequences for a batch of prompts.
+        For single-turn generation, all prompts are processed in one request.
+        `_batch_level_generate_sequences` involves:
+        1.  Extracting and pre-processing prompt token IDs from the input
+            `prompts`. This includes handling padding and preparing raw
+            token ID lists.
+        2.  Preparing inputs for the SGLang engine, including multi-modal
+            data if present.
+        3.  Invoking the SGLang engine (`self._engine.async_generate`,
+            an async coroutine) with the batch of processed inputs and
+            specified sampling parameters on the master TP rank.
+        4.  Broadcasting the results from the master TP rank to all
+            other TP ranks.
+        5.  Post-processing the engine's output to format the generated
+            token IDs and (if applicable) log probabilities.
+        6.  Constructing the final sequences by concatenating original
+            prompts with the generated responses.
+        7.  Updating attention masks and position IDs to reflect the full
+            concatenated sequences.
+        8.  If `self.config.free_cache_engine` is true, the SGLang engine's
+            KV cache is flushed after generation on the master TP rank.
+        Args:
+            prompts: A `DataProto` object containing the batch of
+              input prompts, including tensor data (like `input_ids`,
+              `attention_mask`) and meta-information (like `eos_token_id`,
+              `do_sample`).
+            **kwargs: Additional keyword arguments that can override the
+              default sampling parameters (e.g., `temperature`, `top_p`,
+              `max_new_tokens`). These are temporarily applied using
+              `update_sampling_params`.
+        Returns:
+            DataProto: A `DataProto` object containing the batch of
+              generated sequences. This includes tensors for `prompts`
+              (original input IDs), `responses` (generated token IDs),
+              `input_ids` (concatenated prompt and response),
+              `attention_mask`, and `position_ids` for the full
+              sequences.
+        Note that in GRPO, if the prompts are validated, we repeat the prompts for rollout.n times in ray_trainer.
+        Thus we do not need to repeat the prompts here and set the sampling parameter n to 1.
+        """
+        # input ids: (bs, prompt_length), left-padded
+        idx = prompts.batch["input_ids"]
+        # attention_mask: (bs, seq_length), left-padded
+        attention_mask = prompts.batch["attention_mask"]
+        position_ids = prompts.batch["position_ids"]
+
+        # used to generate attention mask for the
+        # response based on EOS token position
+        eos_token_id = prompts.meta_info["eos_token_id"]
+
+        batch_size = idx.size(0)
+
+        # Extract non-tensor data
+        non_tensor_batch = prompts.non_tensor_batch
+        if "raw_prompt_ids" not in non_tensor_batch:
+            non_tensor_batch["raw_prompt_ids"] = np.array(
+                [_pre_process_inputs(self.pad_token_id, idx[i]).tolist() for i in range(batch_size)],
+                dtype=object,
+            )
+
+        if "multi_modal_data" in non_tensor_batch:
+            sglang_inputs = []
+            for raw_prompt_ids, multi_modal_data in zip(
+                non_tensor_batch.pop("raw_prompt_ids"),
+                non_tensor_batch.pop("multi_modal_data"),
+                strict=True,
+            ):
+                sglang_inputs.append(
+                    {
+                        "prompt_token_ids": raw_prompt_ids,
+                        "multi_modal_data": multi_modal_data,
+                        "image_data": (
+                            multi_modal_data.get("image", None) if isinstance(multi_modal_data, dict) else None
+                        ),
+                    }
+                )
+        else:
+            sglang_inputs = [
+                {"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")
+            ]
+
+        # Ensure token IDs are lists or numpy arrays
+        for input_data in sglang_inputs:
+            if isinstance(input_data["prompt_token_ids"], np.ndarray):
+                input_data["prompt_token_ids"] = input_data["prompt_token_ids"].tolist()
+            elif not isinstance(input_data["prompt_token_ids"], list):
+                raise TypeError(
+                    f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}"
+                )
+
+        # Extract token IDs and image data for SGLang Engine
+        idx_list = [input_data["prompt_token_ids"] for input_data in sglang_inputs]
+        image_list = [input_data.get("image_data", None) for input_data in sglang_inputs]
+
+        do_sample = prompts.meta_info.get("do_sample", True)
+        is_validate = prompts.meta_info.get("validate", False)
+
+        # Create request-level sampling parameters
+        request_sampling_params = self.sampling_params.copy()
+        if not do_sample:
+            request_sampling_params.update(
+                {
+                    "n": 1,
+                    "presence_penalty": 0.0,
+                    "frequency_penalty": 0.0,
+                    "repetition_penalty": 1.0,
+                    "temperature": 0,
+                    "top_p": 1,
+                    "top_k": -1,
+                    "ignore_eos": False,
+                    "min_new_tokens": 0,
+                    "max_new_tokens": self.config.response_length,
+                    "skip_special_tokens": True,
+                    "spaces_between_special_tokens": True,
+                }
+            )
+        elif is_validate:
+            request_sampling_params.update(
+                {
+                    "top_k": self.config.val_kwargs.top_k,
+                    "top_p": self.config.val_kwargs.top_p,
+                    "temperature": self.config.val_kwargs.temperature,
+                    "n": 1,  # if validate, already repeat in ray_trainer
+                }
+            )
+
+        # Update with any additional kwargs
+        request_sampling_params.update(kwargs)
+
+        if self._tp_rank == 0:
+            loop = asyncio.get_event_loop()
+            output = loop.run_until_complete(
+                self._engine.async_generate(
+                    prompt=None,  # because we have already convert it to prompt token id
+                    sampling_params=request_sampling_params,
+                    return_logprob=True,
+                    input_ids=idx_list,
+                    image_data=image_list,
+                )
+            )
+        else:
+            output = None
+
+        # Most naive implementation, can extract tensor and send via gloo if too slow
+        dist.barrier()
+        [output] = broadcast_pyobj(
+            data=[output],
+            rank=self._rank,
+            dist_group=self._device_mesh_cpu["tp"].get_group(),
+            src=self._device_mesh_cpu["tp"].mesh[0].item(),
+            force_cpu_device=False,
+        )
+        out = _post_process_outputs(self.processing_class, output)
+
+        response = out[0].to(idx.device)
+        rollout_log_probs = None
+        if self.config.calculate_log_probs:
+            rollout_log_probs = out[1].to(idx.device)
+
+        if response.shape[1] < self.config.response_length:
+            response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
+            if self.config.calculate_log_probs:
+                rollout_log_probs = pad_sequence_to_length(
+                    rollout_log_probs, self.config.response_length, self.pad_token_id
+                )
+
+        seq = torch.cat([idx, response], dim=-1)
+
+        response_length = response.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+        delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
+        if position_ids.dim() == 3:  # qwen2vl mrope
+            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, 3, -1)
+
+        # TODO(sgm): fix position_ids on right_pad
+        # prompt: left pad + response: right pad
+        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
+        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
+        response_position_ids = position_ids[..., -1:] + delta_position_id
+        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+        response_attention_mask = get_response_mask(
+            response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
+        )
+        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+
+        # all the tp ranks should contain the same data here. data in all ranks are valid
+        batch = TensorDict(
+            {
+                "prompts": idx,
+                "responses": response,
+                "input_ids": seq,  # here input_ids become the whole sentences
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            batch_size=batch_size,
+        )
+        if self.config.calculate_log_probs:
+            # we will recompute old log prob with actor
+            batch["rollout_log_probs"] = rollout_log_probs
+
+        # free cache engine
+        if self._engine is not None and self._tp_rank == 0:
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(self._engine.flush_cache())
+
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+
+    def _maybe_apply_rolling_truncation(self, _req: AsyncRolloutRequest) -> bool:
+        """Apply rolling left-truncation if input exceeds max_model_len.
+
+        Instead of stopping the rollout when context overflows, this
+        truncates old tokens from the left (matching Search-R1 behavior).
+
+        Args:
+            _req: The current rollout request.
+
+        Returns:
+            bool: True if OK to continue (truncation applied or not needed),
+                False if must break (e.g. inference chat template active).
+        """
+        # Use max_model_len - 1 to account for the EOS token that SGLang
+        # reserves (it errors when prompt_len + 1 >= max_model_len).
+        effective_limit = self.config.max_model_len - 1
+        if _req.input_ids.shape[-1] < effective_limit:
+            return True
+        if _req.use_inference_chat_template:
+            logger.warning("Rolling truncation not supported with inference chat template; stopping.")
+            return False
+        keep = effective_limit - self.config.response_length
+        _req._left_truncate_rolling_context(self.processing_class, keep)
+        return True
+
+    def _truncate_tool_response(self, text: str, max_len: int) -> str:
+        """Truncate tool response by tokens or chars based on config.
+
+        Args:
+            text: The tool response text to truncate.
+            max_len: Maximum length (in tokens or chars, depending on config).
+
+        Returns:
+            str: The possibly-truncated tool response text.
+        """
+        unit = getattr(self.config.multi_turn, "tool_response_truncation_unit", "char")
+        if max_len <= 0:
+            return text
+        if unit == "token":
+            ids = self.processing_class.encode(text, add_special_tokens=False)
+            if len(ids) <= max_len:
+                return text
+            return self.processing_class.decode(ids[:max_len], skip_special_tokens=False) + "...(truncated)"
+        else:
+            if len(text) <= max_len:
+                return text
+            return text[:max_len] + "...(truncated)"
+
+    def _build_information_content(
+        self,
+        tool_result: str,
+        turns_done: int,
+        num_search_turns: int,
+    ) -> str:
+        """Build ``<information>`` content, optionally with dynamic guidance.
+
+        Merges the dynamic after_search/final text with the information
+        block, matching the format produced by ``create_task.py``.
+
+        Args:
+            tool_result: Raw search result text (already truncated).
+            turns_done: Number of assistant turns completed so far
+                (including this one).  Uses turn count (not valid-search
+                count) so remaining stays consistent with the task-turn
+                gate after format mistakes.
+            num_search_turns: Total search budget for this conversation.
+
+        Returns:
+            str: The ``<information>`` block, with optional dynamic text
+                appended after a blank line.
+        """
+        info_content = f"<information>{tool_result}</information>"
+        if self._dynamic_msgs and num_search_turns > 0:
+            remaining = num_search_turns - turns_done
+            if remaining > 0:
+                info_content += "\n\n" + self._dynamic_msgs["after_search"].format(
+                    remaining=remaining, target=num_search_turns,
+                )
+            else:
+                info_content += "\n\n" + self._dynamic_msgs["final"].format(
+                    remaining=0, target=num_search_turns,
+                )
+        return info_content
+
+    async def _async_rollout_a_request(
+        self,
+        req: AsyncRolloutRequest,
+        do_sample: bool = True,
+        is_validate: bool = False,
+        **kwargs,
+    ) -> AsyncRolloutRequest:
+        assert self._tp_rank == 0, "only the master process can call this function"
+        _req = deepcopy(req)
+        finish_reason_type = None
+        output = None
+
+        current_turns = 0
+        user_turns = 0
+        user_turn_rewards = []
+        need_force_answer_retry = False
+
+        # Dynamic user turn state (challenger v10)
+        _dyn_searches_done = 0
+        _dyn_num_search_turns = 0
+        _dyn_turn_number = 0
+        if self._dynamic_msgs and _req.messages:
+            # Parse num_search_turns from the prompt (v10 format:
+            # "exactly **N** search turns")
+            first_content = _req.messages[0].content
+            if isinstance(first_content, str):
+                _nst_match = re.search(
+                    r"exactly \*\*(\d+)\*\* search turns", first_content
+                )
+                if _nst_match:
+                    _dyn_num_search_turns = int(_nst_match.group(1))
+            if _dyn_num_search_turns == 0:
+                logger.warning(
+                    "dynamic_msgs enabled but num_search_turns not found "
+                    "in prompt; strict fixed turns will be disabled"
+                )
+
+        # Create request-level sampling parameters
+        request_sampling_params = self.sampling_params.copy()
+        if not do_sample:
+            request_sampling_params.update(
+                {
+                    "n": 1,
+                    "presence_penalty": 0.0,
+                    "frequency_penalty": 0.0,
+                    "repetition_penalty": 1.0,
+                    "temperature": 0,
+                    "top_p": 1,
+                    "top_k": -1,
+                    "ignore_eos": False,
+                    "min_new_tokens": 0,
+                    "max_new_tokens": self.config.response_length,
+                    "skip_special_tokens": True,
+                    "spaces_between_special_tokens": True,
+                }
+            )
+        elif is_validate:
+            request_sampling_params.update(
+                {
+                    "top_k": self.config.val_kwargs.top_k,
+                    "top_p": self.config.val_kwargs.top_p,
+                    "temperature": self.config.val_kwargs.temperature,
+                    "n": 1,  # if validate, already repeat in ray_trainer
+                }
+            )
+
+        # Update with any additional kwargs
+        request_sampling_params.update(kwargs)
+        self._maybe_enable_no_stop_trim(request_sampling_params)
+
+        while current_turns < self.config.multi_turn.max_assistant_turns:
+            if _req.state == AsyncRolloutRequestStateEnum.PENDING:
+                await self._handle_pending_state(_req)
+                _req.state = AsyncRolloutRequestStateEnum.RUNNING
+            elif _req.state == AsyncRolloutRequestStateEnum.TOOL_CALLING:
+                if _req.messages[-1].tool_calls is not None:
+                    parsed_tool_calls = _req.messages[-1].tool_calls
+                    # Separate executable tools from schema-only terminal
+                    # tools (e.g. submit_task, submit_answer) that signal
+                    # conversation completion without needing execution.
+                    executable_calls = [
+                        tc for tc in parsed_tool_calls
+                        if tc.function.name in self._tool_map
+                    ]
+                    terminal_calls = [
+                        tc for tc in parsed_tool_calls
+                        if tc.function.name not in self._tool_map
+                    ]
+                    if terminal_calls and not executable_calls:
+                        # Pure terminal action — conversation is done
+                        finish_reason_type = FinishReasonTypeEnum.STOP
+                        _req.state = AsyncRolloutRequestStateEnum.COMPLETED
+                        break
+                    if terminal_calls and executable_calls:
+                        # Mixed: model emitted both executable and terminal
+                        # calls in the same turn (e.g. search + submit_task).
+                        # Execute the search then terminate.
+                        logger.warning(
+                            f"[{_req.request_id}] Mixed tool calls: "
+                            f"executable={[tc.function.name for tc in executable_calls]}, "
+                            f"terminal={[tc.function.name for tc in terminal_calls]}. "
+                            f"Executing then terminating."
+                        )
+                    tool_call_results = await asyncio.gather(
+                        *[
+                            self._tool_map[tool_call.function.name].execute(
+                                _req.request_id,
+                                tool_call.function.arguments,
+                                **_req.tools_kwargs[tool_call.function.name].get("execute_kwargs", {}),
+                            )
+                            for tool_call in executable_calls
+                        ]
+                    )
+                    max_tool_resp_len = getattr(
+                        self.config.multi_turn, "max_tool_response_length", 0
+                    )
+                    responses = []
+                    for resp, _, _ in tool_call_results:
+                        resp = self._truncate_tool_response(resp, max_tool_resp_len)
+                        responses.append(resp)
+                    _req.add_tool_response_messages(self.processing_class, responses)
+                    for tool_call, (resp, reward, metrics) in zip(executable_calls, tool_call_results, strict=True):
+                        _req.update_metrics(metrics, tool_call.function.name)
+                    # If terminal tools were also present, terminate now
+                    # after having executed the search calls.
+                    if terminal_calls:
+                        finish_reason_type = FinishReasonTypeEnum.STOP
+                        _req.state = AsyncRolloutRequestStateEnum.COMPLETED
+                        break
+                    # Dynamic user turn messages (hermes/tool_call format):
+                    # inject guidance after tool responses, mirroring the
+                    # search_r1 _build_information_content behaviour.
+                    if self._dynamic_msgs and _dyn_num_search_turns > 0:
+                        remaining = _dyn_num_search_turns - _dyn_turn_number
+                        if remaining > 0:
+                            msg = self._dynamic_msgs["after_search"].format(
+                                remaining=remaining, target=_dyn_num_search_turns,
+                            )
+                        else:
+                            msg = self._dynamic_msgs["final"].format(
+                                remaining=0, target=_dyn_num_search_turns,
+                            )
+                        _req.add_user_message(self.processing_class, msg)
+                    if not self._maybe_apply_rolling_truncation(_req):
+                        finish_reason_type = FinishReasonTypeEnum.STOP
+                        break
+                    _req.state = AsyncRolloutRequestStateEnum.RUNNING
+                else:
+                    raise ValueError(f"Unexpected tool calling last message state: {_req.messages[-1]}")
+            elif _req.state == AsyncRolloutRequestStateEnum.RUNNING:
+                # Only continue the conversation if the prompt length is not greater than max_model_len - 1,
+                # since SGLang raises an error when max_new_tokens + 1 is greater to max_model_len (the extra
+                # token accounts for the EOS token).
+                gen_ids = _req.get_generation_prompt_ids(self.processing_class)
+                if len(gen_ids) + 1 >= self.config.max_model_len:
+                    if not self._maybe_apply_rolling_truncation(_req):
+                        finish_reason_type = FinishReasonTypeEnum.LENGTH
+                        break
+                    # Re-fetch after truncation (input_ids changed)
+                    gen_ids = _req.get_generation_prompt_ids(self.processing_class)
+
+                # Save decoded per-turn prompt for validation analysis
+                if is_validate:
+                    _req.per_turn_prompts.append(
+                        self.processing_class.decode(gen_ids, skip_special_tokens=False)
+                    )
+
+                # Video support is not implemented yet
+                image_data = (
+                    _req.multi_modal_data["image"]
+                    if _req.multi_modal_data and "image" in _req.multi_modal_data
+                    else None
+                )
+                video_data = (
+                    _req.multi_modal_data["video"]
+                    if _req.multi_modal_data and "video" in _req.multi_modal_data
+                    else None
+                )
+                if video_data:
+                    logger.warning(
+                        "video support is not implemented yet, current length of video data is %d", len(video_data)
+                    )
+
+                output = await self._handle_engine_call(_req, request_sampling_params, image_data=image_data)
+                content = self._reappend_stop_tags_if_needed(output["text"], request_sampling_params.get("stop"))
+                finish_reason_type = FinishReasonTypeEnum.from_str(output["meta_info"]["finish_reason"]["type"])
+                current_turns += 1
+                _dyn_turn_number += 1
+
+                # Always run multi-turn parsing, even on LENGTH (max tokens
+                # exceeded).  The model may have produced a valid tool call
+                # early in the response and then degenerated into repetitive
+                # tokens that filled the budget.  Parsing will truncate at
+                # the first actionable tag and continue the conversation.
+                # If no actionable tag is found the format-specific fallback
+                # still breaks out of the loop, so behaviour for genuinely
+                # exhausted responses is unchanged.
+                if True:
+                    # search_r1 format: post-generation parsing with position-based priority.
+                    # Instead of relying on </search> stop tokens (which caused training
+                    # collapse when the model generated <search> inside <answer> blocks),
+                    # we parse the full generated text after completion.
+                    # The first complete tag pair wins:
+                    #   - If <answer>...</answer> opens first → extract answer, turn is terminal
+                    #   - If <search>...</search> completes first → execute search
+                    # Dead tokens after the first actionable event are truncated.
+                    if self._multi_turn_format == "search_r1":
+                        answer_match = re.search(r"<answer>(.*?)</answer>", content, re.DOTALL)
+                        search_match = re.search(r"<search>(.*?)</search>", content, re.DOTALL)
+                        # Only non-empty searches participate in position priority.
+                        # Empty <search></search> is an invalid action, not a real search.
+                        valid_search = search_match if (search_match and search_match.group(1).strip()) else None
+
+                        # Determine which tag appears first by start position.
+                        # Tie-break: answer wins (defensive — shouldn't happen with valid XML).
+                        answer_first = answer_match and (
+                            not valid_search or answer_match.start() <= valid_search.start()
+                        )
+                        search_first = valid_search and (
+                            not answer_match or valid_search.start() < answer_match.start()
+                        )
+
+                        if answer_first:
+                            # <answer> opens before any complete <search>. Truncate at </answer>.
+                            # Nested <search> tags inside answer are treated as answer text
+                            # (preserves v1.9.5 safety: never execute search inside answer).
+                            content = content[:answer_match.end()]
+                            _req.add_assistant_message(self.processing_class, content)
+                            break
+
+                        elif search_first:
+                            # <search> completes before <answer> opens. Truncate at </search>.
+                            # Discard hallucinated content after the first </search>.
+                            content = content[:search_match.end()]
+
+                            # Strict fixed turns: don't execute search on the
+                            # task turn — model should produce <task> instead.
+                            if (
+                                self._dynamic_msgs
+                                and _dyn_num_search_turns > 0
+                                and _dyn_turn_number > _dyn_num_search_turns
+                            ):
+                                _req.add_assistant_message(self.processing_class, content)
+                                break  # Task turn — one chance, complete
+
+                            # Validation: suppress search on last turn, force answer instead
+                            if is_validate and current_turns >= self.config.multi_turn.max_assistant_turns:
+                                _req.add_assistant_message(self.processing_class, content)
+                                need_force_answer_retry = True
+                                break
+
+                            query = search_match.group(1).strip()
+                            _req.add_assistant_message(self.processing_class, content)
+                            # Execute search tool directly (pass dict, not JSON string)
+                            tool_result, _, metrics = await self._tool_map["search"].execute(
+                                _req.request_id,
+                                {"query_list": [query]},
+                                **_req.tools_kwargs.get("search", {}).get("execute_kwargs", {}),
+                            )
+                            # Unwrap JSON {"result": "..."} to plain text for search_r1.
+                            # SearchTool.execute() returns json.dumps({"result": text}),
+                            # but search_r1 expects plain text inside <information> tags
+                            # (matching original Search-R1 repo behavior).
+                            try:
+                                parsed = json.loads(tool_result)
+                                tool_result = parsed.get("result", tool_result)
+                            except (json.JSONDecodeError, TypeError, AttributeError):
+                                pass  # keep original if not valid JSON
+                            # Truncate after unwrapping so limit applies to actual content
+                            max_tool_resp_len = getattr(
+                                self.config.multi_turn, "max_tool_response_length", 0
+                            )
+                            tool_result = self._truncate_tool_response(tool_result, max_tool_resp_len)
+                            _dyn_searches_done += 1
+                            info_content = self._build_information_content(
+                                tool_result, _dyn_turn_number, _dyn_num_search_turns,
+                            )
+                            _req.add_user_message(
+                                self.processing_class, info_content
+                            )
+                            _req.update_metrics(metrics, "search")
+                            if not self._maybe_apply_rolling_truncation(_req):
+                                finish_reason_type = FinishReasonTypeEnum.STOP
+                                break
+                            continue  # Stay in RUNNING state for next generation
+
+                        else:
+                            # No complete answer or valid search — turn ends
+                            # Truncate after the last structural closing tag
+                            # (</task> or </answer>) to discard trailing
+                            # tokens generated past the boundary.
+                            task_close_idx = content.rfind("</task>")
+                            answer_close_idx = content.rfind("</answer>")
+                            last_structural = max(
+                                task_close_idx + len("</task>") if task_close_idx != -1 else -1,
+                                answer_close_idx + len("</answer>") if answer_close_idx != -1 else -1,
+                            )
+                            if last_structural > 0:
+                                content = content[:last_structural]
+                            _req.add_assistant_message(self.processing_class, content)
+                            # Early task: <task> present → stop immediately
+                            if "<task>" in content:
+                                break
+                            # Strict fixed turns (dynamic mode): format
+                            # mistake during search phase → send dynamic
+                            # message and continue to next turn.
+                            if (
+                                self._dynamic_msgs
+                                and _dyn_num_search_turns > 0
+                                and _dyn_turn_number <= _dyn_num_search_turns
+                            ):
+                                remaining = _dyn_num_search_turns - _dyn_turn_number
+                                if remaining > 0:
+                                    msg = self._dynamic_msgs["no_result"].format(
+                                        remaining=remaining,
+                                        target=_dyn_num_search_turns,
+                                    )
+                                else:
+                                    msg = self._dynamic_msgs["final"].format(
+                                        remaining=0,
+                                        target=_dyn_num_search_turns,
+                                    )
+                                _req.add_user_message(
+                                    self.processing_class, msg
+                                )
+                                if not self._maybe_apply_rolling_truncation(_req):
+                                    finish_reason_type = FinishReasonTypeEnum.STOP
+                                    break
+                                continue
+                            # Dynamic mode, task turn: one chance only
+                            if (
+                                self._dynamic_msgs
+                                and _dyn_num_search_turns > 0
+                                and _dyn_turn_number > _dyn_num_search_turns
+                            ):
+                                break
+                            # Legacy: error feedback for unclosed/empty search tags
+                            if (
+                                "<search>" in content
+                                and current_turns < self.config.multi_turn.max_assistant_turns
+                                and "<task>" not in content
+                            ):
+                                _req.add_user_message(
+                                    self.processing_class, self._INVALID_ACTION_MESSAGE
+                                )
+                                if not self._maybe_apply_rolling_truncation(_req):
+                                    finish_reason_type = FinishReasonTypeEnum.STOP
+                                    break
+                                continue
+                            if (
+                                is_validate
+                                and current_turns >= self.config.multi_turn.max_assistant_turns
+                            ):
+                                need_force_answer_retry = True
+                            break
+
+                    # function_calls_xml: bare <answer>/<task> XML (without
+                    # <function_calls> wrapper) is a valid terminal action.
+                    # Strip <think> blocks first so tags mentioned inside
+                    # reasoning don't trigger false terminal detection.
+                    if self._multi_turn_format == "function_calls_xml" and "<function_calls>" not in content:
+                        _stripped = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+                        _stripped = re.sub(r"<think>.*", "", _stripped, flags=re.DOTALL)
+                        if (
+                            re.search(r"<answer>.*?</answer>", _stripped, re.DOTALL)
+                            or re.search(r"<task>.*?</task>", _stripped, re.DOTALL)
+                        ):
+                            _req.add_assistant_message(self.processing_class, content)
+                            break
+
+                    # function_calls format: regex-based <function_calls> detection
+                    # for OLMo native tool-calling (search, task, answer functions)
+                    if self._multi_turn_format in ("function_calls", "function_calls_xml") and "<function_calls>" in content:
+                        # Check for search function call
+                        fc_search_match = re.search(
+                            r'<function_calls>\s*search\s*\(\s*query\s*=\s*["\'](.+?)["\']\s*\)',
+                            content, re.DOTALL,
+                        )
+                        # Check for terminal function calls (task or answer)
+                        fc_terminal = re.search(
+                            r'<function_calls>\s*(?:task|answer)\s*\(', content, re.DOTALL,
+                        )
+                        # For function_calls_xml, also check bare XML terminal
+                        # tags (after stripping <think>).  XML answer/task
+                        # takes priority over a same-turn search.
+                        if self._multi_turn_format == "function_calls_xml" and not fc_terminal:
+                            _stripped_fc = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+                            _stripped_fc = re.sub(r"<think>.*", "", _stripped_fc, flags=re.DOTALL)
+                            if (
+                                re.search(r"<answer>.*?</answer>", _stripped_fc, re.DOTALL)
+                                or re.search(r"<task>.*?</task>", _stripped_fc, re.DOTALL)
+                            ):
+                                fc_terminal = True  # type: ignore[assignment]
+                        if fc_search_match and fc_search_match.group(1).strip():
+                            # Strict: don't execute search on the task turn
+                            if (
+                                self._dynamic_msgs
+                                and _dyn_num_search_turns > 0
+                                and _dyn_turn_number > _dyn_num_search_turns
+                            ):
+                                _req.add_assistant_message(self.processing_class, content)
+                                break  # Task turn — complete
+
+                            # Valid search function call
+                            if is_validate and current_turns >= self.config.multi_turn.max_assistant_turns:
+                                _req.add_assistant_message(self.processing_class, content)
+                                if not fc_terminal:
+                                    need_force_answer_retry = True
+                                break
+
+                            query = fc_search_match.group(1).strip()
+                            _req.add_assistant_message(self.processing_class, content)
+                            tool_result, _, metrics = await self._tool_map["search"].execute(
+                                _req.request_id,
+                                {"query_list": [query]},
+                                **_req.tools_kwargs.get("search", {}).get("execute_kwargs", {}),
+                            )
+                            try:
+                                parsed = json.loads(tool_result)
+                                tool_result = parsed.get("result", tool_result)
+                            except (json.JSONDecodeError, TypeError, AttributeError):
+                                pass
+                            max_tool_resp_len = getattr(
+                                self.config.multi_turn, "max_tool_response_length", 0
+                            )
+                            tool_result = self._truncate_tool_response(tool_result, max_tool_resp_len)
+                            _dyn_searches_done += 1
+                            info_content = self._build_information_content(
+                                tool_result, _dyn_turn_number, _dyn_num_search_turns,
+                            )
+                            _req.add_user_message(
+                                self.processing_class, info_content
+                            )
+                            _req.update_metrics(metrics, "search")
+                            if not self._maybe_apply_rolling_truncation(_req):
+                                finish_reason_type = FinishReasonTypeEnum.STOP
+                                break
+                            continue
+                        elif fc_terminal:
+                            # Terminal function call (task or answer) — stop generation
+                            _req.add_assistant_message(self.processing_class, content)
+                            break
+                        else:
+                            # Invalid or unrecognized function call
+                            _req.add_assistant_message(self.processing_class, content)
+                            # Strict fixed turns (dynamic mode): format
+                            # mistake during search phase → send dynamic
+                            # message and continue.
+                            if (
+                                self._dynamic_msgs
+                                and _dyn_num_search_turns > 0
+                                and _dyn_turn_number <= _dyn_num_search_turns
+                            ):
+                                remaining = _dyn_num_search_turns - _dyn_turn_number
+                                if remaining > 0:
+                                    msg = self._dynamic_msgs["no_result"].format(
+                                        remaining=remaining,
+                                        target=_dyn_num_search_turns,
+                                    )
+                                else:
+                                    msg = self._dynamic_msgs["final"].format(
+                                        remaining=0,
+                                        target=_dyn_num_search_turns,
+                                    )
+                                _req.add_user_message(
+                                    self.processing_class, msg
+                                )
+                                if not self._maybe_apply_rolling_truncation(_req):
+                                    finish_reason_type = FinishReasonTypeEnum.STOP
+                                    break
+                                continue
+                            # Dynamic mode, task turn: one chance only
+                            if (
+                                self._dynamic_msgs
+                                and _dyn_num_search_turns > 0
+                                and _dyn_turn_number > _dyn_num_search_turns
+                            ):
+                                break
+                            # Legacy: error feedback for invalid function calls
+                            if current_turns < self.config.multi_turn.max_assistant_turns:
+                                _req.add_user_message(
+                                    self.processing_class, self._INVALID_ACTION_MESSAGE_FC
+                                )
+                                if not self._maybe_apply_rolling_truncation(_req):
+                                    finish_reason_type = FinishReasonTypeEnum.STOP
+                                    break
+                                continue
+                            break
+
+                    # Strip <think> blocks before tool-call parsing so that
+                    # reasoning about tool calls (common in Qwen3) isn't mistaken
+                    # for actual tool invocations. Also strip unclosed <think>.
+                    _content_for_tc = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+                    _content_for_tc = re.sub(r"<think>.*", "", _content_for_tc, flags=re.DOTALL)
+                    if self._function_call_parser and self._function_call_parser.has_tool_call(_content_for_tc):
+                        finish_reason_type = FinishReasonTypeEnum.TOOL_CALL
+                        _req.state = AsyncRolloutRequestStateEnum.TOOL_CALLING
+                        try:
+                            normed_content, tool_calls = self._function_call_parser.parse_non_stream(_content_for_tc)
+                        except JSONDecodeError:
+                            logger.warning(
+                                "Tool-call JSONDecodeError. content[:500]: %s",
+                                content[:500],
+                            )
+                            normed_content = content
+                            tool_calls = []
+                        except AttributeError:
+                            logger.warning(
+                                "Tool-call AttributeError. content[:500]: %s",
+                                content[:500],
+                            )
+                            normed_content = content
+                            tool_calls = []
+                        if not tool_calls:
+                            logger.warning(
+                                "has_tool_call=True but parse returned 0 "
+                                "calls. content[:500]: %s",
+                                _content_for_tc[:500],
+                            )
+                        parsed_tool_calls = []
+                        for tool_call in tool_calls:
+                            function, has_decode_error = OpenAIFunctionCallSchema.from_openai_function_parsed_schema(
+                                OpenAIFunctionParsedSchema(
+                                    name=tool_call.name,
+                                    arguments=tool_call.parameters,
+                                )
+                            )
+                            # Drop the tool call if its arguments has decode error
+                            if has_decode_error:
+                                continue
+                            parsed_tool_calls.append(
+                                OpenAIFunctionToolCall(
+                                    id=str(tool_call.tool_index),
+                                    function=function,
+                                )
+                            )
+                        if len(parsed_tool_calls) > 0:
+                            # Restore <think> block that was stripped for
+                            # tool-call parsing.  The chat template handles
+                            # think visibility (strips from previous turns,
+                            # preserves for current turn).
+                            _think_block = re.search(r"<think>.*?</think>", content, re.DOTALL)
+                            _msg_content = (_think_block.group(0) + "\n" if _think_block else "") + normed_content
+                            _req.add_assistant_message(
+                                self.processing_class, _msg_content, tool_calls=parsed_tool_calls
+                            )
+                        else:
+                            _req.add_assistant_message(self.processing_class, content)
+                            # Malformed tool call: nudge if under max turns, else hard-stop
+                            if current_turns < self.config.multi_turn.max_assistant_turns:
+                                _req.add_user_message(
+                                    self.processing_class, self._INVALID_ACTION_MESSAGE_TC
+                                )
+                                # Reset state from TOOL_CALLING back to RUNNING for retry
+                                _req.state = AsyncRolloutRequestStateEnum.RUNNING
+                                if not self._maybe_apply_rolling_truncation(_req):
+                                    finish_reason_type = FinishReasonTypeEnum.STOP
+                                    break
+                                continue
+                            finish_reason_type = FinishReasonTypeEnum.STOP
+                            _req.state = AsyncRolloutRequestStateEnum.COMPLETED
+                            break
+                    else:
+                        _req.add_assistant_message(
+                            self.processing_class,
+                            content,
+                        )
+                        # Strict fixed turns: handle plain-text output
+                        # (no format-specific tags at all).  This covers
+                        # function_calls models that omit <function_calls>.
+                        if (
+                            self._dynamic_msgs
+                            and _dyn_num_search_turns > 0
+                        ):
+                            if "<task>" in content:
+                                break
+                            if _dyn_turn_number <= _dyn_num_search_turns:
+                                remaining = _dyn_num_search_turns - _dyn_turn_number
+                                if remaining > 0:
+                                    msg = self._dynamic_msgs["no_result"].format(
+                                        remaining=remaining,
+                                        target=_dyn_num_search_turns,
+                                    )
+                                else:
+                                    msg = self._dynamic_msgs["final"].format(
+                                        remaining=0,
+                                        target=_dyn_num_search_turns,
+                                    )
+                                _req.add_user_message(
+                                    self.processing_class, msg
+                                )
+                                if not self._maybe_apply_rolling_truncation(_req):
+                                    finish_reason_type = FinishReasonTypeEnum.STOP
+                                    break
+                                continue
+                            # Task turn: one chance only
+                            break
+                        # search_r1: invalid action (no <search>, <answer>, or <task>) — give error feedback
+                        if (
+                            self._multi_turn_format == "search_r1"
+                            and current_turns < self.config.multi_turn.max_assistant_turns
+                            and "<answer>" not in content
+                            and "<task>" not in content
+                        ):
+                            _req.add_user_message(
+                                self.processing_class, self._INVALID_ACTION_MESSAGE
+                            )
+                            if not self._maybe_apply_rolling_truncation(_req):
+                                finish_reason_type = FinishReasonTypeEnum.STOP
+                                break
+                            continue
+                        # function_calls: invalid action (no <function_calls>) — give error feedback
+                        if (
+                            self._multi_turn_format == "function_calls"
+                            and current_turns < self.config.multi_turn.max_assistant_turns
+                            and "<function_calls>" not in content
+                        ):
+                            _req.add_user_message(
+                                self.processing_class, self._INVALID_ACTION_MESSAGE_FC
+                            )
+                            if not self._maybe_apply_rolling_truncation(_req):
+                                finish_reason_type = FinishReasonTypeEnum.STOP
+                                break
+                            continue
+                        # function_calls_xml: invalid action (no FC search, no XML answer/task).
+                        # Strip <think> blocks before checking so tags inside
+                        # reasoning don't suppress the error feedback.
+                        if (
+                            self._multi_turn_format == "function_calls_xml"
+                            and current_turns < self.config.multi_turn.max_assistant_turns
+                            and "<function_calls>" not in content
+                        ):
+                            _stripped_inv = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+                            _stripped_inv = re.sub(r"<think>.*", "", _stripped_inv, flags=re.DOTALL)
+                            _has_terminal = (
+                                re.search(r"<answer>.*?</answer>", _stripped_inv, re.DOTALL)
+                                or re.search(r"<task>.*?</task>", _stripped_inv, re.DOTALL)
+                            )
+                        if (
+                            self._multi_turn_format == "function_calls_xml"
+                            and current_turns < self.config.multi_turn.max_assistant_turns
+                            and "<function_calls>" not in content
+                            and not _has_terminal  # type: ignore[possibly-undefined]
+                        ):
+                            _req.add_user_message(
+                                self.processing_class, self._INVALID_ACTION_MESSAGE_FC_XML
+                            )
+                            if not self._maybe_apply_rolling_truncation(_req):
+                                finish_reason_type = FinishReasonTypeEnum.STOP
+                                break
+                            continue
+                        # hermes/tool_call: invalid action (no tool call and no terminal action)
+                        if (
+                            self._function_call_parser
+                            and self._multi_turn_format not in ("search_r1", "function_calls", "function_calls_xml")
+                            and current_turns < self.config.multi_turn.max_assistant_turns
+                            and "<answer>" not in content
+                            and "<task>" not in content
+                        ):
+                            _req.add_user_message(
+                                self.processing_class, self._INVALID_ACTION_MESSAGE_TC
+                            )
+                            if not self._maybe_apply_rolling_truncation(_req):
+                                finish_reason_type = FinishReasonTypeEnum.STOP
+                                break
+                            continue
+                        if (
+                            is_validate
+                            and (
+                                self._multi_turn_format in ("search_r1", "function_calls", "function_calls_xml")
+                                or self._function_call_parser
+                            )
+                            and current_turns >= self.config.multi_turn.max_assistant_turns
+                            and "<answer>" not in content
+                            and "<function_calls>" not in content
+                            and "<task>" not in content
+                        ):
+                            need_force_answer_retry = True
+                            break
+                        if (
+                            _req.interaction_kwargs
+                            and self.interaction_map
+                            and user_turns < self.config.multi_turn.max_user_turns
+                            and current_turns < self.config.multi_turn.max_assistant_turns
+                        ):
+                            _req.state = AsyncRolloutRequestStateEnum.INTERACTING
+                        else:
+                            break
+            elif _req.state == AsyncRolloutRequestStateEnum.INTERACTING:
+                user_turns += 1
+                messages = [{"role": x.role, "content": x.content} for x in _req.messages]
+
+                # Get interaction by name from interaction_kwargs
+                interaction_name = _req.interaction_kwargs.get(
+                    "name", "gsm8k"
+                )  # Default to gsm8k for backward compatibility
+                if interaction_name not in self.interaction_map:
+                    raise ValueError(
+                        f"Interaction '{interaction_name}' not found in interaction_map. Available interactions: "
+                        f"{list(self.interaction_map.keys())}"
+                    )
+
+                interaction = self.interaction_map[interaction_name]
+                should_terminate_sequence, content, reward, metrics = await interaction.generate_response(
+                    _req.request_id, messages, **_req.interaction_kwargs
+                )
+                user_turn_rewards.append(reward)
+                if should_terminate_sequence:
+                    finish_reason_type = FinishReasonTypeEnum.STOP
+                    _req.state = AsyncRolloutRequestStateEnum.COMPLETED
+                    break
+                else:
+                    _req.add_user_message(self.processing_class, content)
+                    if not self._maybe_apply_rolling_truncation(_req):
+                        finish_reason_type = FinishReasonTypeEnum.STOP
+                        break
+                    else:
+                        _req.state = AsyncRolloutRequestStateEnum.RUNNING
+
+        if need_force_answer_retry:
+            nudge_msg = (
+                self._FORCE_ANSWER_NUDGE_FC
+                if self._multi_turn_format == "function_calls"
+                else self._FORCE_ANSWER_NUDGE
+            )
+            _req.add_user_message(self.processing_class, nudge_msg)
+
+            for _retry in range(self._MAX_FORCE_ANSWER_RETRIES):
+                gen_ids = _req.get_generation_prompt_ids(self.processing_class)
+                if len(gen_ids) + 1 >= self.config.max_model_len:
+                    if not self._maybe_apply_rolling_truncation(_req):
+                        finish_reason_type = FinishReasonTypeEnum.LENGTH
+                        break
+                    # Re-fetch after truncation (input_ids changed)
+                    gen_ids = _req.get_generation_prompt_ids(self.processing_class)
+
+                image_data = (
+                    _req.multi_modal_data["image"]
+                    if _req.multi_modal_data and "image" in _req.multi_modal_data
+                    else None
+                )
+                output = await self._handle_engine_call(_req, request_sampling_params, image_data=image_data)
+                content = self._reappend_stop_tags_if_needed(output["text"], request_sampling_params.get("stop"))
+                finish_reason_type = FinishReasonTypeEnum.from_str(output["meta_info"]["finish_reason"]["type"])
+                _req.add_assistant_message(self.processing_class, content)
+
+                if finish_reason_type == FinishReasonTypeEnum.LENGTH:
+                    break
+                if "</answer>" in content or "</function_calls>" in content or "<task>" in content:
+                    finish_reason_type = FinishReasonTypeEnum.STOP
+                    break
+
+                # Model still didn't answer — re-nudge
+                _req.add_user_message(self.processing_class, nudge_msg)
+
+        if current_turns >= self.config.multi_turn.max_assistant_turns and not need_force_answer_retry:
+            finish_reason_type = FinishReasonTypeEnum.STOP
+
+        # Calculate the reward for each tool
+        async def calc_reward_and_release_fn(name: str, tool: BaseTool):
+            reward = await tool.calc_reward(_req.request_id, **_req.tools_kwargs[name].get("calc_reward_kwargs", {}))
+            await tool.release(_req.request_id, **_req.tools_kwargs[name].get("release_kwargs", {}))
+            return name, reward
+
+        tool_reward_tasks = []
+        for name in _req.tools_kwargs.keys():
+            tool = self._tool_map[name]
+            tool_reward_tasks.append(calc_reward_and_release_fn(name, tool))
+        tool_reward_scores = await asyncio.gather(*tool_reward_tasks)
+        tool_reward_scores = dict(tool_reward_scores)
+        all_rewards = {**tool_reward_scores, **{"user_turn_rewards": user_turn_rewards}}
+        _req.finalize(self.processing_class, all_rewards, finish_reason_type)
+
+
+        return _req
+
+    async def _handle_engine_call(
+        self, _req: AsyncRolloutRequest, sampling_params: dict, image_data: Optional[list[Any]] = None
+    ) -> dict:
+        generation_prompt_ids = _req.get_generation_prompt_ids(self.processing_class)
+        return await self._handle_engine_generate(generation_prompt_ids, sampling_params, image_data)
+
+    async def _handle_engine_generate(
+        self, generation_prompt_ids: list[int], sampling_params: dict, image_data: Optional[list[Any]] = None
+    ) -> dict:
+        max_new_tokens = max(1, min(self.config.response_length, self.config.max_model_len - len(generation_prompt_ids) - 1))
+        kwargs = sampling_params.copy()
+        self._maybe_enable_no_stop_trim(kwargs)
+        kwargs["max_new_tokens"] = max_new_tokens
+        kwargs["n"] = 1  # group size is supported in preprocess
+        output = await self._engine.async_generate(
+            input_ids=generation_prompt_ids,
+            sampling_params=kwargs,
+            return_logprob=False,
+            image_data=image_data,
+        )
+        return output
+
+    async def _handle_pending_state(self, _req: AsyncRolloutRequest) -> AsyncRolloutRequest:
+        if _req.tool_schemas is not None:
+            tool_creation_coroutines = []
+            for tool_schema in _req.tool_schemas:
+                tool_name = tool_schema.function.name
+                if tool_name not in self._tool_map:
+                    # Schema-only tool (e.g. task, answer) — no executable backend
+                    continue
+                tool = self._tool_map[tool_name]
+                create_kwargs = _req.tools_kwargs[tool.name].get("create_kwargs", {})
+                tool_creation_coroutines.append(tool.create(_req.request_id, **create_kwargs))
+            await asyncio.gather(*tool_creation_coroutines)
+        elif self._multi_turn_format in ("search_r1", "function_calls") and _req.tools_kwargs:
+            tool_creation_coroutines = []
+            for tool_name in _req.tools_kwargs:
+                tool = self._tool_map[tool_name]
+                create_kwargs = _req.tools_kwargs[tool_name].get("create_kwargs", {})
+                tool_creation_coroutines.append(tool.create(_req.request_id, **create_kwargs))
+            await asyncio.gather(*tool_creation_coroutines)
+        if _req.interaction_kwargs and self.interaction_map:
+            interaction_kwargs = _req.interaction_kwargs
+            # Get interaction by name from interaction_kwargs
+            interaction_name = interaction_kwargs.get("name", "gsm8k")  # Default to gsm8k for backward compatibility
+            if interaction_name not in self.interaction_map:
+                raise ValueError(
+                    f"Interaction '{interaction_name}' not found in interaction_map. Available interactions: "
+                    f"{list(self.interaction_map.keys())}"
+                )
+
+            interaction = self.interaction_map[interaction_name]
+            await interaction.start_interaction(_req.request_id, **interaction_kwargs)
+
+    @GPUMemoryLogger(role="sglang rollout", logger=logger)
+    @torch.no_grad()
+    def generate_sequences_with_tools(self, prompts: DataProto, **kwargs) -> DataProto:
+        logger.warning(
+            "`generate_sequences_with_tools` is deprecated, please use `generate_sequences(...)`",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._req_level_generate_sequences(prompts, **kwargs)
+
+    @GPUMemoryLogger(role="sglang rollout", logger=logger)
+    @torch.no_grad()
+    def _req_level_generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        """Generates multi-turn sequences for a batch of prompts.
+        For multi-turn generation, each prompt is processed separately via
+        `_req_level_generate_sequences` for better tool calling control.
+        Note that in multi-turn generation, we repeat the prompts for rollout.n times in ray_trainer.
+        Thus we do not need to repeat the prompts here and set the sampling parameter n to 1.
+        """
+        # Async rollout with tools support
+        do_sample = prompts.meta_info.get("do_sample", True)
+        is_validate = prompts.meta_info.get("validate", False)
+        tgt_device = prompts.batch["input_ids"].device
+        if self._tp_rank == 0:
+            req_list = self._preprocess_prompt_to_async_rollout_requests(
+                prompts,
+            )
+            loop = asyncio.get_event_loop()
+            output_req_list = loop.run_until_complete(
+                asyncio.gather(
+                    *[self._async_rollout_a_request(req, do_sample, is_validate, **kwargs) for req in req_list],
+                )
+            )
+            sorted_output_req_list = sorted(output_req_list, key=lambda x: (x.batch_data_id, x.rollout_offset))
+
+            # Batch-level diagnostic summary (print, not logger, to ensure visibility)
+            _n_total = len(sorted_output_req_list)
+            _n_with_answer = sum(
+                1 for r in sorted_output_req_list
+                if any(
+                    getattr(m, "content", "") and "</answer>" in str(m.content)
+                    for m in r.messages if getattr(m, "role", "") == "assistant"
+                )
+            )
+            _n_with_search = sum(
+                1 for r in sorted_output_req_list
+                if any(
+                    getattr(m, "role", "") == "tool" or
+                    (getattr(m, "content", "") and "<information>" in str(m.content))
+                    for m in r.messages
+                )
+            )
+            _resp_lens = [r.response_ids.shape[-1] for r in sorted_output_req_list if r.response_ids is not None]
+            _avg_resp = sum(_resp_lens) / max(len(_resp_lens), 1)
+            _msg_counts = [len(r.messages) for r in sorted_output_req_list]
+            print(
+                f"\n[rollout-summary] batch={_n_total} answered={_n_with_answer}/{_n_total} "
+                f"searched={_n_with_search}/{_n_total} "
+                f"avg_resp_len={_avg_resp:.0f} avg_msgs={sum(_msg_counts)/max(len(_msg_counts),1):.1f} "
+                f"validate={is_validate}",
+                flush=True,
+            )
+        else:
+            sorted_output_req_list = None
+
+        dist.barrier()
+        [sorted_output_req_list] = broadcast_pyobj(
+            data=[sorted_output_req_list],
+            rank=self._rank,
+            dist_group=self._device_mesh_cpu["tp"].get_group(),
+            src=self._device_mesh_cpu["tp"].mesh[0].item(),
+            force_cpu_device=False,
+        )
+        # Construct the batch data
+        prompt_ids, response_ids = [], []
+        prompt_attention_mask, response_attention_mask = [], []
+        prompt_position_ids, response_position_ids = [], []
+        prompt_loss_mask, response_loss_mask = [], []
+        messages = []
+        reward_scores = []
+        multi_modal_inputs = []
+        request_ids = []
+
+        for req in sorted_output_req_list:
+            assert req.state == AsyncRolloutRequestStateEnum.COMPLETED, f"Request {req.request_id} is not completed"
+            assert (
+                req.input_ids.shape[-1]
+                == req.attention_mask.shape[-1]
+                == req.position_ids.shape[-1]
+                == req.loss_mask.shape[-1]
+            ), f"""Request {req.request_id} has different length of 
+                {req.input_ids.shape[-1]=}, {req.attention_mask.shape[-1]=}, 
+                {req.position_ids.shape[-1]=}, {req.loss_mask.shape[-1]=}"""
+            error_message_lines = [
+                f"""Request {req.request_id} has input_ids length {req.input_ids.shape[-1]}
+                    greater than max_model_len {self.config.max_model_len}""",
+                f"Decoded input_ids: {self.processing_class.decode(req.input_ids.squeeze(0))}",
+                f"Decoded prompt_ids: {self.processing_class.decode(req.prompt_ids.squeeze(0))}",
+                f"Decoded response_ids: {self.processing_class.decode(req.response_ids.squeeze(0))}",
+                f"Messages: {req.messages}",
+                f"Max model length: {req.max_model_len}",
+            ]
+            error_message = "\n".join(error_message_lines)
+            assert req.input_ids.shape[-1] <= self.config.max_model_len, error_message
+
+            prompt_ids.append(req.prompt_ids.to(tgt_device).squeeze(0))
+            response_ids.append(req.response_ids.to(tgt_device).squeeze(0))
+            if req.response_ids.shape[-1] > self.config.response_length:
+                logger.warning(
+                    f"""{req.request_id=} has response_ids length {req.response_ids.shape[-1]} 
+                    greater than max_response_len {self.config.response_length},\n{req=}"""
+                )
+            prompt_attention_mask.append(req.prompt_attention_mask.to(tgt_device).squeeze(0))
+            response_attention_mask.append(req.response_attention_mask.to(tgt_device).squeeze(0))
+            prompt_position_ids.append(req.prompt_position_ids.to(tgt_device).squeeze(0))
+            response_position_ids.append(req.response_position_ids.to(tgt_device).squeeze(0))
+            prompt_loss_mask.append(req.prompt_loss_mask.to(tgt_device).squeeze(0))
+            response_loss_mask.append(req.response_loss_mask.to(tgt_device).squeeze(0))
+            messages.append({"messages": req.messages})
+            reward_scores.append(req.reward_scores)
+            multi_modal_inputs.append(req.multi_modal_inputs)
+            request_ids.append(req.request_id)
+
+        prompt_ids = pad_sequence(
+            prompt_ids,
+            batch_first=True,
+            padding_value=self.pad_token_id,
+            padding_side="left",
+        )
+        if prompt_ids.shape[-1] < self.config.prompt_length:
+            prompt_ids = pad_sequence_to_length(prompt_ids, self.config.prompt_length, self.pad_token_id, left_pad=True)
+        response_ids = pad_sequence(response_ids, batch_first=True, padding_value=self.pad_token_id)
+        if response_ids.shape[-1] < self.config.response_length:
+            response_ids = pad_sequence_to_length(response_ids, self.config.response_length, self.pad_token_id)
+        prompt_attention_mask = pad_sequence(
+            prompt_attention_mask,
+            batch_first=True,
+            padding_value=0,
+            padding_side="left",
+        )
+        if prompt_attention_mask.shape[-1] < self.config.prompt_length:
+            prompt_attention_mask = pad_sequence_to_length(
+                prompt_attention_mask, self.config.prompt_length, 0, left_pad=True
+            )
+        response_attention_mask = pad_sequence(response_attention_mask, batch_first=True, padding_value=0)
+        if response_attention_mask.shape[-1] < self.config.response_length:
+            response_attention_mask = pad_sequence_to_length(response_attention_mask, self.config.response_length, 0)
+
+        # padding prompt_position_ids
+        if prompt_position_ids[0].dim() == 2:
+            # if prompt_position_ids is a 2D tensor
+            # e.g. from qwen2vl, prompt_position_ids.shape = (3, seq_len)
+            transposed_prompt_position_ids = [p.transpose(0, 1) for p in prompt_position_ids]
+            prompt_position_ids = pad_sequence(
+                transposed_prompt_position_ids, batch_first=True, padding_value=0, padding_side="left"
+            )
+            prompt_position_ids = prompt_position_ids.transpose(1, 2)
+        else:
+            prompt_position_ids = pad_sequence(
+                prompt_position_ids, batch_first=True, padding_value=0, padding_side="left"
+            )
+        if prompt_position_ids.shape[-1] < self.config.prompt_length:
+            prompt_position_ids = pad_sequence_to_length(
+                prompt_position_ids, self.config.prompt_length, 0, left_pad=True
+            )
+
+        # padding response_position_ids
+        if response_position_ids[0].dim() == 2:
+            # if response_position_ids is a 2D tensor
+            # e.g. from qwen2vl, response_position_ids.shape = (3, seq_len)
+            transposed_response_position_ids = [p.transpose(0, 1) for p in response_position_ids]
+            response_position_ids = pad_sequence(
+                transposed_response_position_ids, batch_first=True, padding_value=0, padding_side="left"
+            )
+            response_position_ids = response_position_ids.transpose(1, 2)
+        else:
+            response_position_ids = pad_sequence(response_position_ids, batch_first=True, padding_value=0)
+        if response_position_ids.shape[-1] < self.config.response_length:
+            response_position_ids = pad_sequence_to_length(response_position_ids, self.config.response_length, 0)
+
+        prompt_loss_mask = pad_sequence(prompt_loss_mask, batch_first=True, padding_value=0, padding_side="left")
+        if prompt_loss_mask.shape[1] < self.config.prompt_length:
+            prompt_loss_mask = pad_sequence_to_length(prompt_loss_mask, self.config.prompt_length, 0, left_pad=True)
+        response_loss_mask = pad_sequence(response_loss_mask, batch_first=True, padding_value=0)
+        if response_loss_mask.shape[1] < self.config.response_length:
+            response_loss_mask = pad_sequence_to_length(response_loss_mask, self.config.response_length, 0)
+
+        input_ids = torch.cat((prompt_ids, response_ids), dim=-1)
+        attention_mask = torch.cat((prompt_attention_mask, response_attention_mask), dim=-1)
+        position_ids = torch.cat((prompt_position_ids, response_position_ids), dim=-1)
+
+        # Construct the batch data
+        batch = TensorDict(
+            {
+                "prompts": prompt_ids,
+                "responses": response_ids,
+                "response_mask": response_loss_mask,
+                "input_ids": input_ids,  # here input_ids become the whole sentences
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            batch_size=len(sorted_output_req_list),
+        )
+
+        # free cache engine
+        if self._engine is not None and self._tp_rank == 0:
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(self._engine.flush_cache())
+
+        non_tensor_batch = {
+            "messages": np.array(messages),
+            "reward_scores": np.array(reward_scores),
+            "request_id": np.array(request_ids),
+            "per_turn_prompts": np.array(
+                [req.per_turn_prompts for req in sorted_output_req_list], dtype=object
+            ),
+        }
+
+        is_multimodal = isinstance(self.processing_class, ProcessorMixin) and (
+            hasattr(self.processing_class, "image_processor") or hasattr(self.model_hf_config, "vision_config")
+        )
+
+        if is_multimodal:
+            non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs, dtype=object)
+
+        return DataProto(
+            batch=batch,
+            non_tensor_batch=non_tensor_batch,
+        )
+
+    def _preprocess_prompt_to_async_rollout_requests(self, prompts: DataProto, n: int = 1) -> list[AsyncRolloutRequest]:
+        assert "raw_prompt" in prompts.non_tensor_batch, (
+            "need data.return_raw_chat=True, due to no official way do parse_messages"
+        )
+        logger.info(
+            "n is deprecated for SGLang rollout since ray ppo trainer will repeat the prompts for rollout.n times"
+        )
+        req_list = []
+        multi_modal_data_list = prompts.non_tensor_batch.get(
+            "multi_modal_data", [None] * len(prompts.non_tensor_batch["raw_prompt"])
+        )
+
+        for data_idx, (raw_prompt, multi_modal_data) in enumerate(
+            zip(prompts.non_tensor_batch["raw_prompt"], multi_modal_data_list, strict=True)
+        ):
+            if self._tool_schemas:
+                _tools_kwargs = prompts.non_tensor_batch["tools_kwargs"][data_idx]
+                if self._multi_turn_format == "search_r1":
+                    _tool_schemas = None  # search_r1: describe tools in prompt text
+                elif self._multi_turn_format in ("function_calls", "function_calls_xml"):
+                    if self._fc_tool_names is not None:
+                        _tool_schemas = [_FC_TOOL_REGISTRY[name] for name in self._fc_tool_names]
+                    else:
+                        # Backward-compatible default: challenger (search + task)
+                        _tool_schemas = [_FC_SEARCH_TOOL_SCHEMA, _FC_TASK_TOOL_SCHEMA]
+                else:
+                    _tool_schemas = self._all_tool_schema_objects
+                _input_ids = None
+                _attention_mask = None
+            else:
+                _input_ids = _pre_process_inputs(self.pad_token_id, prompts.batch["input_ids"][data_idx])
+                _attention_mask = _pre_process_inputs(0, prompts.batch["attention_mask"][data_idx])
+                _tools_kwargs = {}
+                _tool_schemas = None
+
+            if self.interaction_map:
+                _interaction_kwargs = prompts.non_tensor_batch["interaction_kwargs"][data_idx]
+            else:
+                _interaction_kwargs = {}
+
+            req = AsyncRolloutRequest(
+                batch_data_id=data_idx,
+                rollout_offset=0,
+                request_id=str(uuid4()),
+                state=AsyncRolloutRequestStateEnum.PENDING,
+                messages=raw_prompt.tolist() if hasattr(raw_prompt, 'tolist') else list(raw_prompt),
+                multi_modal_data=multi_modal_data,
+                tool_schemas=_tool_schemas,
+                tools_kwargs=_tools_kwargs,
+                interaction_kwargs=_interaction_kwargs,
+                input_ids=_input_ids,
+                response_ids=None,
+                attention_mask=_attention_mask,
+                response_attention_mask=None,
+                response_position_ids=None,
+                response_loss_mask=None,
+                reward_scores={},
+                max_prompt_len=self.config.prompt_length,
+                max_response_len=self.config.response_length,
+                max_model_len=self.config.max_model_len,
+                use_inference_chat_template=self.config.multi_turn.use_inference_chat_template,
+                tokenization_sanity_check_mode=self.config.multi_turn.tokenization_sanity_check_mode,
+                processing_class=self.processing_class,
+            )
+            error_message = f"""Request {req.request_id} has mismatched lengths: 
+            input_ids={req.input_ids.shape[-1]}, 
+            attention_mask={req.attention_mask.shape[-1]}, 
+            position_ids={req.position_ids.shape[-1]}, 
+            loss_mask={req.loss_mask.shape[-1]}"""
+            assert (
+                req.input_ids.shape[-1]
+                == req.attention_mask.shape[-1]
+                == req.position_ids.shape[-1]
+                == req.loss_mask.shape[-1]
+            ), error_message
+            req_list.append(req)
+
+        return req_list
+
+    async def chat_completion(self, json_request):
+        assert self._tp_rank == 0, "only called in tp rank 0"
+        _input_ids = None
+        _attention_mask = None
+        _position_ids = None
+        _tool_schemas = []
+        _tools_kwargs = {}
+
+        req = AsyncRolloutRequest(
+            request_id=str(uuid4()),
+            state=AsyncRolloutRequestStateEnum.PENDING,
+            messages=[Message.model_validate(msg) for msg in json_request["messages"]],
+            tool_schemas=_tool_schemas,
+            tools_kwargs=_tools_kwargs,
+            input_ids=_input_ids,
+            prompt_ids=_input_ids,
+            response_ids=None,
+            attention_mask=_attention_mask,
+            prompt_attention_mask=_attention_mask,
+            response_attention_mask=None,
+            position_ids=_position_ids,
+            prompt_position_ids=_position_ids,
+            response_position_ids=None,
+            loss_mask=None,
+            prompt_loss_mask=None,
+            response_loss_mask=None,
+            reward_scores={},
+            max_prompt_len=self.config.prompt_length,
+            max_response_len=self.config.response_length,
+            max_model_len=self.config.max_model_len,
+            use_inference_chat_template=self.config.multi_turn.use_inference_chat_template,
+            tokenization_sanity_check_mode=self.config.multi_turn.tokenization_sanity_check_mode,
+            processing_class=self.processing_class,
+        )
+
+        # json_request already contains sampling_params
+        # Filter only valid SamplingParams arguments
+        valid_sampling_params = {}
+        temp_sampling_params = SamplingParams()  # Create temporary instance to check valid attributes
+        for k, v in json_request.items():
+            if k not in ["messages", "model", "tools"] and hasattr(temp_sampling_params, k):
+                valid_sampling_params[k] = v
+        output = await self._handle_engine_call(req, valid_sampling_params)
+        # it can be Dict or AsyncIterator[Dict]
+        if isinstance(output, dict):
+            outputs = [output]
+        else:
+            outputs = output
+
+        # build openai chat completion format
+        choices = []
+        id = None
+        for i, content in enumerate(outputs):
+            choices.append(
+                {
+                    "index": i,
+                    "message": {
+                        "role": "assistant",
+                        "content": content["text"],
+                    },
+                    "finish_reason": content["meta_info"]["finish_reason"]["type"],
+                }
+            )
+            id = content["meta_info"]["id"]
+
+        return {
+            "id": "chatcmpl-" + id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": json_request.get("model", "sglang_model"),
+            "choices": choices,
+        }
+
+        # this function is left for uniform train-inference resharding
+
+    async def generate(
+        self, prompt_ids: torch.Tensor, sampling_params: dict[str, Any], request_id: str
+    ) -> torch.Tensor:
+        request_sampling_params = self.sampling_params.copy()
+        request_sampling_params.update(sampling_params)
+        output = await self._handle_engine_generate(prompt_ids, request_sampling_params)
+        return output["output_ids"]
+
+    async def wake_up(self):
+        if not self.is_sleep:
+            return
+        await self.sharding_manager.wake_up()  # pylint: disable=C2801
+        self.is_sleep = False
+
+    # this function is left for uniform train-inference resharding
+    async def sleep(self):
+        if self.is_sleep:
+            return
+        await self.sharding_manager.sleep()
+        self.is_sleep = True

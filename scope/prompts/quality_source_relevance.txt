@@ -1,0 +1,30 @@
+You are a strict binary grader. You will see a SOURCE DOCUMENT and a TASK PROMPT.
+
+Rubric — Source-Document Relevance:
+Score 1 if the task is topically related to the source document — i.e., the task asks about people, events, places, concepts, or themes that appear in or directly relate to the source document.
+Score 0 if the task is clearly unrelated to the source document — i.e., the task asks about a topic, domain, or entity that has no connection to the source material.
+
+Rules:
+- The task does NOT need to be answerable solely from the source document; it only needs to be topically related.
+- Generic or vague tasks that could apply to any document should score 0.
+- Tasks that reference specific entities, events, or themes from the source document should score 1.
+
+Output format (MANDATORY — follow exactly):
+1. Wrap your reasoning in <think>...</think> tags
+2. Then output your score in <score>...</score> tags — ONLY 0 or 1, nothing else
+
+[POSITIVE EXAMPLE]
+<source_document>Star Trek is an American science fiction media franchise created by Gene Roddenberry. The franchise began with the original television series in 1966...</source_document>
+<task_prompt>Describe the cultural impact of Gene Roddenberry's Star Trek franchise on science fiction television.</task_prompt>
+<think>The task asks about Star Trek and Gene Roddenberry, both of which are central topics in the source document. Clearly related.</think>
+<score>1</score>
+
+[NEGATIVE EXAMPLE]
+<source_document>Star Trek is an American science fiction media franchise created by Gene Roddenberry. The franchise began with the original television series in 1966...</source_document>
+<task_prompt>What were the primary causes of the 2008 global financial crisis?</task_prompt>
+<think>The source document is about the Star Trek franchise. The task asks about the 2008 financial crisis, which is completely unrelated to Star Trek or science fiction.</think>
+<score>0</score>
+
+Now grade:
+<source_document>{source_document}</source_document>
+<task_prompt>{task_prompt}</task_prompt>

@@ -1,0 +1,70 @@
+{#- OLMo3 chat template with consistent <|im_end|> for all assistant turns.
+
+    The default OLMo3 template uses eos_token (<|endoftext|>) to end the last
+    assistant message but <|im_end|> for non-last assistant messages.  This
+    causes a train-inference tokenization gap when prompts are built
+    incrementally (each assistant message is treated as "last").
+
+    Fix: always emit <|im_end|>\n after assistant messages regardless of
+    position, making the template position-invariant.
+-#}
+{%- set has_system = messages|selectattr('role', 'equalto', 'system')|list|length > 0 -%}
+{%- if not has_system -%}
+{{- '<|im_start|>system\nYou are a helpful function-calling AI assistant. ' -}}
+{%- if tools is none -%}
+{{- 'You do not currently have access to any functions. <functions></functions><|im_end|>\n' -}}
+{%- else -%}
+{{- 'You are provided with function signatures within <functions></functions> XML tags. You may call one or more functions to assist with the user query. Output any function calls within <function_calls></function_calls> XML tags. Do not make assumptions about what values to plug into functions.' -}}
+{{- '<functions>' -}}
+{{- tools | tojson -}}
+{{- '</functions><|im_end|>\n' -}}
+{%- endif -%}
+{%- endif -%}
+{%- for message in messages -%}
+{%- if message['role'] == 'system' -%}
+{{- '<|im_start|>system\n' + message['content'] -}}
+{%- if tools is not none -%}
+{{- '<functions>' -}}
+{{- tools | tojson -}}
+{{- '</functions>' -}}
+{%- elif message.get('functions', none) is not none -%}
+{{- ' <functions>' + message['functions'] + '</functions>' -}}
+{%- endif -%}
+{{- '<|im_end|>\n' -}}
+{%- elif message['role'] == 'user' -%}
+{{- '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' -}}
+{%- elif message['role'] == 'assistant' -%}
+{{- '<|im_start|>assistant\n' -}}
+{%- if message.get('content', none) is not none -%}
+{{- message['content'] -}}
+{%- endif -%}
+{%- if message.get('function_calls', none) is not none -%}
+{{- '<function_calls>' + message['function_calls'] + '</function_calls>' -}}
+{% elif message.get('tool_calls', none) is not none %}
+{{- '<function_calls>' -}}
+{%- for tool_call in message['tool_calls'] %}
+{%- if tool_call is mapping and tool_call.get('function', none) is not none %}
+{%- set args = tool_call['function']['arguments'] -%}
+{%- set ns = namespace(arguments_list=[]) -%}
+{%- for key, value in args.items() -%}
+{%- set ns.arguments_list = ns.arguments_list + [key ~ '=' ~ (value | tojson)] -%}
+{%- endfor -%}
+{%- set arguments = ns.arguments_list | join(', ') -%}
+{{- tool_call['function']['name'] + '(' + arguments + ')' -}}
+{%- if not loop.last -%}{{ '\n' }}{%- endif -%}
+{% else %}
+{{- tool_call -}}
+{%- endif %}
+{%- endfor %}
+{{- '</function_calls>' -}}
+{%- endif -%}
+{{- '<|im_end|>' + '\n' -}}
+{%- elif message['role'] == 'environment' -%}
+{{- '<|im_start|>environment\n' + message['content'] + '<|im_end|>\n' -}}
+{%- elif message['role'] == 'tool' -%}
+{{- '<|im_start|>environment\n' + message['content'] + '<|im_end|>\n' -}}
+{%- endif -%}
+{%- if loop.last and add_generation_prompt -%}
+{{- '<|im_start|>assistant\n' -}}
+{%- endif -%}
+{%- endfor -%}

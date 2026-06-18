@@ -1,0 +1,2 @@
+Condense or transform existing content into shorter/different formats. Requires source material to work from.
+Examples: "Summarize this paper in 3 paragraphs", "Extract key takeaways from this transcript"

@@ -1,0 +1,4 @@
+The task MUST be a single short question ending with "?" — one sentence only.
+The answer MUST be at most 10 words (a name, date, number, or short phrase) from the LAST search result. Include it in <answer> tags.
+Name only the source entity; describe each searched entity by its relation to the previous one, not by name.
+Do not ask compound questions with "and". If the answer would require multiple items, redesign to target one.

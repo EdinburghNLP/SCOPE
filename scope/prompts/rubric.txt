@@ -1,0 +1,43 @@
+Generate evaluation rubrics for the following task.
+
+## Task Type
+{task_type}
+
+## Task Prompt
+{task_prompt}
+
+## Context Documents
+{documents}
+
+## Instructions
+
+Generate **3-5 positive rubrics** that measure excellence at the task's core objectives.
+
+### Rubric Writing Rules
+
+1. **Conciseness**: Each rubric MUST be a SINGLE sentence of at most ~25 words. Each rubric contains a single clear requirement — not compound.
+
+2. **Command Verb Requirement**: Every rubric MUST begin with a command verb.
+   - Command verbs: Addresses, Demonstrates, Provides, Incorporates, Synthesizes, Identifies, Explains, Compares, Evaluates, Integrates, Supports, Applies
+
+3. **Priority Levels**: Assign exactly one priority to each rubric:
+   - `critical` - Core requirements; failure means the response is inadequate
+   - `important` - Significant quality indicators; affects overall quality substantially
+   - `bonus` - Excellence markers; distinguishes good from exceptional responses
+
+4. **Discriminative Power**: For each rubric, verify:
+   - Is it specific to THIS task (not generic)?
+   - Would it clearly differentiate a good response from a bad one?
+   - Can it be reliably and objectively judged?
+
+## Output Format
+
+Output exactly this XML structure:
+
+```xml
+<rubrics>
+  <rubric priority="critical|important|bonus">Single-sentence rubric starting with command verb.</rubric>
+  <rubric priority="...">...</rubric>
+  <!-- 3-5 rubrics total -->
+</rubrics>
+```
