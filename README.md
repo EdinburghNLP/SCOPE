@@ -107,9 +107,7 @@ python scope/prepare_validation_data.py --format qwen3
 python scope/prepare_validation_data.py --format olmo3
 ```
 
-These commands write `data/validation_qwen25.parquet`, `data/validation_qwen3.parquet`, and `data/validation_olmo3.parquet`, respectively. Each file combines Search-R1 short-form QA with the fixed long-form benchmark suite. Search-R1 gold answers are always converted to semantic-equivalence rubrics so they are evaluated by the LLM judge.
-
-No separate generated-task dataset is required. Each `training/train_*.sh` run creates challenger prompts, samples tasks, filters them by quality and difficulty, and writes the per-iteration task parquet files before Solver training.
+These commands write `data/validation_qwen25.parquet`, `data/validation_qwen3.parquet`, and `data/validation_olmo3.parquet`, respectively.  
 
 ## Running Training
 
