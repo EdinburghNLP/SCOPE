@@ -2,11 +2,10 @@
 
 # SCOPE: Self-Play via Co-Evolving Policies for Open-Ended Tasks
 
-Code for reproducing SCOPE, a self-play training pipeline for open-ended search agents.
+Code for reproducing SCOPE, a self-play training pipeline for open-ended tasks.
 
 [![Paper](https://img.shields.io/badge/paper-A42C25?style=for-the-badge&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2605.31433)
 [![Project Page](https://img.shields.io/badge/project%20page-1f6feb?style=for-the-badge&logo=googlechrome&logoColor=white)](https://edinburghnlp.github.io/scope/)
-[![Code](https://img.shields.io/badge/code-000000?style=for-the-badge&logo=github&logoColor=white)](https://github.com/EdinburghNLP/SCOPE)
 [![Models](https://img.shields.io/badge/models-FFD21E?style=for-the-badge&logo=huggingface&logoColor=black)](https://huggingface.co/collections/wckwan/scope)
 [![W&B Logs](https://img.shields.io/badge/W%26B%20Logs-00B4AB?style=for-the-badge&logo=weightsandbiases&logoColor=white)](https://wandb.ai/cyruskwan/SCOPE/table)
 
